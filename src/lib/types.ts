@@ -1,0 +1,36 @@
+export enum LaneType {
+  RESEARCH = "RESEARCH",
+  CODE = "CODE",
+  DATA = "DATA",
+  OUTREACH = "OUTREACH",
+}
+
+export enum AgentStatus {
+  INACTIVE = "INACTIVE",
+  ACTIVE = "ACTIVE",
+  LISTED = "LISTED",
+  SUSPENDED = "SUSPENDED",
+}
+
+export enum TaskState {
+  CREATED = "CREATED",
+  LOCKED = "LOCKED",
+  SUBMITTED = "SUBMITTED",
+  VERIFIED = "VERIFIED",
+  SETTLED = "SETTLED",
+  SLASHED = "SLASHED",
+}
+
+export enum CommitmentStatus {
+  ACTIVE = "ACTIVE",
+  RELEASED_CLEAN = "RELEASED_CLEAN",
+  RELEASED_EARLY = "RELEASED_EARLY",
+  EXPIRED = "EXPIRED",
+}
+
+export enum RecipientRole {
+  WORKER = "WORKER",
+  COLLABORATOR = "COLLABORATOR",
+  SENSEI = "SENSEI",
+  TREASURY = "TREASURY",
+}
