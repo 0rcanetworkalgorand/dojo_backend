@@ -92,18 +92,26 @@ export class IndexerListener {
 
     private async processBlock(round: number) {
         try {
+            // Fetch block with 'msgpack' format (standard for SDK v3)
             const blockResponse = await algorand.client.algod.block(round).do();
-            const txns = (blockResponse as any).block.txns || [];
+            
+            // Handle different block structures depending on node/SDK version
+            const txns = (blockResponse as any)?.block?.txns || (blockResponse as any)?.block?.transactions || [];
 
             for (const txn of txns) {
-                const dt = txn.txn;
-                if (dt.type === 'appl') {
-                    const appId = dt.apid || 0;
-                    if (Number(appId) === this.registryAppId) {
-                        await this.handleRegistryCall(txn);
-                    } else if (Number(appId) === this.escrowAppId) {
-                        await this.handleEscrowCall(txn);
+                try {
+                    // Extract transaction data - handle both msgpack and JSON-like structures
+                    const dt = txn.txn || txn;
+                    if (dt.type === 'appl') {
+                        const appId = dt.apid || dt.apaid || 0;
+                        if (Number(appId) === this.registryAppId) {
+                            await this.handleRegistryCall(txn);
+                        } else if (Number(appId) === this.escrowAppId) {
+                            await this.handleEscrowCall(txn);
+                        }
                     }
+                } catch (txnErr) {
+                    console.error(`[Indexer] Error parsing transaction in block ${round}:`, txnErr);
                 }
             }
         } catch (e) {
@@ -112,7 +120,8 @@ export class IndexerListener {
     }
 
     private async handleRegistryCall(txn: any) {
-        const apaa = txn.txn.apaa;
+        // Handle both possible locations for apaa depending on how block was decoded
+        const apaa = txn.txn?.apaa || txn.apaa;
         if (!apaa || apaa.length === 0) return;
 
         const selector = Buffer.from(apaa[0]).toString('hex');
@@ -121,12 +130,16 @@ export class IndexerListener {
 
         try {
             const abiMethod = new algosdk.ABIMethod(method);
+            // Ensure args are Uint8Arrays for decodeMethodArgs
             const args = (abiMethod as any).decodeMethodArgs(apaa.slice(1).map((a: any) => new Uint8Array(a)));
 
             if (method.name === 'register_agent') {
                 const [agentId, sensei, lane, configHash] = args;
-                const agentIdStr = agentId.toString();
+                const agentIdStr = typeof agentId === 'string' ? agentId : Buffer.from(agentId as Uint8Array).toString('utf-8');
                 const senseiAddr = sensei.toString();
+                
+                console.log(`[Indexer] Processing Registration: ${agentIdStr}...`);
+
                 const agent = await prisma.agent.upsert({
                     where: { id: agentIdStr },
                     update: { 
@@ -140,26 +153,30 @@ export class IndexerListener {
                         senseiAddress: senseiAddr,
                         lane: this.mapLane(Number(lane)),
                         configHash: Buffer.from(configHash as Uint8Array).toString('hex'),
-                        status: AgentStatus.ACTIVE
+                        status: AgentStatus.ACTIVE,
+                        tasksCompleted: BigInt(0),
+                        totalEarnedUsdc: BigInt(0)
                     }
                 });
-                console.log(`[Indexer] Registered Agent: ${agentIdStr} (Sensei: ${senseiAddr})`);
+                console.log(`[Indexer] ✅ Registered Agent: ${agentIdStr} (Sensei: ${senseiAddr})`);
                 this.broadcastEvent('AGENT_REGISTERED', agent);
             } else if (method.name === 'update_status') {
                 const [agentId, active] = args;
+                const agentIdStr = typeof agentId === 'string' ? agentId : Buffer.from(agentId as Uint8Array).toString('utf-8');
                 const agent = await prisma.agent.update({
-                    where: { id: agentId.toString() },
+                    where: { id: agentIdStr },
                     data: { status: active ? AgentStatus.ACTIVE : AgentStatus.INACTIVE }
                 });
+                console.log(`[Indexer] Status Updated: ${agentIdStr} -> ${active ? 'ACTIVE' : 'INACTIVE'}`);
                 this.broadcastEvent('AGENT_STATUS_UPDATED', agent);
             }
-        } catch (e) {
-            console.error('[Indexer] Registry decode error:', e);
+        } catch (e: any) {
+            console.error('[Indexer] Registry decode error:', e.message || e);
         }
     }
 
     private async handleEscrowCall(txn: any) {
-        const apaa = txn.txn.apaa;
+        const apaa = txn.txn?.apaa || txn.apaa;
         if (!apaa || apaa.length === 0) return;
 
         const selector = Buffer.from(apaa[0]).toString('hex');
@@ -172,8 +189,12 @@ export class IndexerListener {
 
             if (method.name === 'lock_bounty') {
                 const [taskId, client, worker, bounty, collateral, deadline] = args;
+                const taskIdStr = typeof taskId === 'string' ? taskId : Buffer.from(taskId as Uint8Array).toString('utf-8');
+                
+                console.log(`[Indexer] Processing Task Lock: ${taskIdStr}...`);
+
                 const task = await prisma.task.upsert({
-                    where: { id: taskId.toString() },
+                    where: { id: taskIdStr },
                     update: {
                         state: TaskState.LOCKED,
                         bountyUsdc: BigInt(bounty.toString()),
@@ -183,7 +204,7 @@ export class IndexerListener {
                         deadline: new Date(Number(deadline) * 1000)
                     },
                     create: {
-                        id: taskId.toString(),
+                        id: taskIdStr,
                         state: TaskState.LOCKED,
                         bountyUsdc: BigInt(bounty.toString()),
                         collateralUsdc: BigInt(collateral.toString()),
@@ -193,6 +214,7 @@ export class IndexerListener {
                         deadline: new Date(Number(deadline) * 1000)
                     }
                 });
+                console.log(`[Indexer] ✅ Task Locked: ${taskIdStr} (Worker: ${worker.toString()})`);
                 this.broadcastEvent('TASK_LOCKED', task);
 
                 // Trigger Agent Execution!
@@ -206,14 +228,16 @@ export class IndexerListener {
                 }
             } else if (method.name === 'release_payment') {
                 const [taskId] = args;
+                const taskIdStr = typeof taskId === 'string' ? taskId : Buffer.from(taskId as Uint8Array).toString('utf-8');
                 const task = await prisma.task.update({
-                    where: { id: taskId.toString() },
+                    where: { id: taskIdStr },
                     data: { state: TaskState.SETTLED, settledAt: new Date() }
                 });
+                console.log(`[Indexer] ✅ Payment Released for Task: ${taskIdStr}`);
                 this.broadcastEvent('TASK_SETTLED', task);
             }
-        } catch (e) {
-            console.error('[Indexer] Escrow decode error:', e);
+        } catch (e: any) {
+            console.error('[Indexer] Escrow decode error:', e.message || e);
         }
     }
 

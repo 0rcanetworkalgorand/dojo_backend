@@ -3,42 +3,152 @@ import { prisma } from '../lib/prisma';
 import { TaskState, LaneType } from '../lib/types';
 import { broadcast } from '../lib/socket';
 import { AuctionService } from '../services/AuctionService';
+import { TaskExecutor } from '../services/taskExecutor';
 
 const router = Router();
 const auctionService = new AuctionService();
 
-// Client: Post a new task requirement
+// ── Keyword-based lane detection ─────────────────────────────────────
+const LANE_KEYWORDS: Record<string, string[]> = {
+    RESEARCH: ['research', 'analyze', 'analysis', 'report', 'study', 'investigate', 'sentiment', 'market', 'trend', 'scrape', 'survey', 'insight', 'whitepaper', 'summarize', 'explore', 'review', 'audit'],
+    CODE: ['code', 'build', 'develop', 'debug', 'deploy', 'smart contract', 'frontend', 'backend', 'api', 'fix', 'implement', 'refactor', 'test', 'program', 'software', 'typescript', 'python', 'solidity', 'rust'],
+    DATA: ['data', 'dataset', 'etl', 'clean', 'visualize', 'chart', 'graph', 'statistics', 'model', 'pipeline', 'sql', 'csv', 'database', 'dashboard', 'metric', 'analytics'],
+    OUTREACH: ['outreach', 'social', 'twitter', 'community', 'marketing', 'campaign', 'content', 'post', 'engagement', 'growth', 'brand', 'influencer', 'newsletter', 'discord', 'telegram'],
+};
+
+function detectLane(description: string): { lane: string; confidence: number; scores: Record<string, number> } {
+    const lower = description.toLowerCase();
+    const scores: Record<string, number> = {};
+
+    for (const [lane, keywords] of Object.entries(LANE_KEYWORDS)) {
+        scores[lane] = keywords.reduce((sum, kw) => {
+            // Whole-word matching for better accuracy
+            const regex = new RegExp(`\\b${kw}\\b`, 'gi');
+            const matches = lower.match(regex);
+            return sum + (matches ? matches.length : 0);
+        }, 0);
+    }
+
+    const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+    const topLane = sorted[0][0];
+    const topScore = sorted[0][1];
+    const totalScore = Object.values(scores).reduce((s, v) => s + v, 0);
+    const confidence = totalScore > 0 ? Math.round((topScore / totalScore) * 100) : 0;
+
+    return { lane: topScore > 0 ? topLane : 'RESEARCH', confidence: topScore > 0 ? confidence : 25, scores };
+}
+
+// ── Match agents to a task description ───────────────────────────────
+router.post('/match', async (req, res) => {
+    const { description } = req.body;
+
+    if (!description || description.trim().length < 5) {
+        return res.status(400).json({ error: 'Please provide a task description (at least 5 characters).' });
+    }
+
+    try {
+        const detection = detectLane(description);
+        console.log(`[TaskMatch] Detected lane: ${detection.lane} (confidence: ${detection.confidence}%) for: "${description.substring(0, 60)}..."`);
+
+        // Fetch agents matching the detected lane
+        const agents = await prisma.agent.findMany({
+            where: {
+                lane: detection.lane,
+                status: 'ACTIVE',
+            },
+        });
+
+        // Also fetch agents from secondary lanes if confidence is low
+        let secondaryAgents: any[] = [];
+        if (detection.confidence < 60) {
+            const secondaryLanes = Object.entries(detection.scores)
+                .filter(([l, s]) => l !== detection.lane && s > 0)
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 1)
+                .map(([l]) => l);
+
+            if (secondaryLanes.length > 0) {
+                secondaryAgents = await prisma.agent.findMany({
+                    where: {
+                        lane: { in: secondaryLanes },
+                        status: 'ACTIVE',
+                    },
+                });
+            }
+        }
+
+        const allAgents = [...agents, ...secondaryAgents].map(a => ({
+            ...a,
+            name: (a as any).name || `Agent ${a.address.substring(0, 8)}`,
+            taskCount: Number(a.tasksCompleted),
+            successRate: 100,
+            totalEarned: Number(a.totalEarnedUsdc) / 1_000_000,
+            commitmentExpiry: a.listingExpiry ? new Date(a.listingExpiry).getTime() : Date.now() + 30 * 24 * 60 * 60 * 1000,
+            isPrimaryMatch: agents.some(pa => pa.id === a.id),
+        }));
+
+        res.json({
+            detectedLane: detection.lane,
+            confidence: detection.confidence,
+            scores: detection.scores,
+            agents: allAgents,
+        });
+    } catch (error) {
+        console.error('[TaskMatch] Error:', error);
+        res.status(500).json({ error: 'Failed to match agents' });
+    }
+});
+
+// Client: Post a new task requirement (called from /hire page)
 router.post('/', async (req, res) => {
-    const { title, description, lane, bountyUsdc, clientAddress, deadlineDays } = req.body;
+    const { title, description, lane, bountyUsdc, clientAddress, deadlineDays, stakeTxId, agentAddress, agentId: reqAgentId } = req.body;
 
     try {
         const deadline = new Date();
         deadline.setDate(deadline.getDate() + (deadlineDays || 7));
 
+        // Find the agent to assign
+        let agentId = reqAgentId || null;
+        if (!agentId && agentAddress) {
+            const agent = await prisma.agent.findFirst({ where: { address: agentAddress, status: 'ACTIVE' } });
+            agentId = agent?.id || null;
+        }
+
         const task = await prisma.task.create({
             data: {
                 id: crypto.randomUUID(),
-                lane: lane as LaneType,
-                bountyUsdc: BigInt(bountyUsdc),
-                clientAddress,
+                title: title || null,
+                description: description || null,
+                lane: (lane as LaneType) || 'RESEARCH',
+                bountyUsdc: BigInt(bountyUsdc || 0),
+                clientAddress: clientAddress || 'unknown',
+                agentId,
+                workerAddress: agentAddress || null,
                 state: TaskState.CREATED,
                 deadline,
-                // We'll store metadata in description for now or a separate field if added
             }
         });
 
-        // Notify agents via WebSocket
+        console.log(`[TaskRoutes] Task ${task.id} created. Lane: ${task.lane}, Agent: ${agentId || 'none'}`);
+
+        // Notify via WebSocket
         broadcast('NEW_TASK', {
             id: task.id,
             title,
             description,
             lane: task.lane,
             bountyUsdc: task.bountyUsdc.toString(),
-            deadline: task.deadline
+            deadline: task.deadline,
+            state: task.state
         });
 
-        // Start off-chain auction
-        auctionService.startAuction(task.id);
+        // ── Trigger AI execution asynchronously ──
+        // This fires in the background — the response returns immediately
+        if (description && description.trim().length > 0) {
+            TaskExecutor.executeTask(task.id).catch(err => {
+                console.error(`[TaskRoutes] Background execution failed for ${task.id}:`, err);
+            });
+        }
 
         res.status(201).json({ 
             ...task, 
@@ -88,6 +198,25 @@ router.get('/', async (req, res) => {
         res.json(serialized);
     } catch (error) {
         res.status(500).json({ error: 'Failed to fetch tasks' });
+    }
+});
+
+// Get a specific task by ID (for polling results)
+router.get('/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const task = await prisma.task.findUnique({
+            where: { id },
+            include: { agent: true }
+        });
+        if (!task) return res.status(404).json({ error: 'Task not found' });
+        res.json({
+            ...task,
+            bountyUsdc: task.bountyUsdc.toString(),
+            collateralUsdc: task.collateralUsdc?.toString()
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch task' });
     }
 });
 
