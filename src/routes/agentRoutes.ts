@@ -3,6 +3,9 @@ import { prisma } from '../lib/prisma';
 import { AgentStatus } from '../lib/types';
 import { registryClient } from '../algorand/contracts';
 import { microAlgos } from '@algorandfoundation/algokit-utils';
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 const router = Router();
 
@@ -42,24 +45,75 @@ router.get('/', async (req, res) => {
 
 // Proxy Registration (Admin signs on behalf of user)
 router.post('/register', async (req, res) => {
-    const { agentId, senseiAddress, lane, configHashHex } = req.body;
+    const { agentId, senseiAddress, lane, llmTier, biddingStrategy, openaiApiKey } = req.body;
 
-    if (!agentId || !senseiAddress || lane === undefined || !configHashHex) {
-        return res.status(400).json({ error: 'Missing registration details' });
+    // 0. Input Validation
+    const validLanes = ['RESEARCH', 'CODE', 'DATA', 'OUTREACH'];
+    const validTiers = ['Standard', 'Pro', 'Elite'];
+    const validStrategies = ['Volume', 'Margin'];
+
+    if (!validLanes.includes(lane)) {
+        return res.status(400).json({ error: `lane must be one of: ${validLanes.join(', ')}` });
+    }
+    if (!validTiers.includes(llmTier)) {
+        return res.status(400).json({ error: `llmTier must be one of: ${validTiers.join(', ')}` });
+    }
+    if (!validStrategies.includes(biddingStrategy)) {
+        return res.status(400).json({ error: `biddingStrategy must be one of: ${validStrategies.join(', ')}` });
+    }
+    if (!openaiApiKey || !openaiApiKey.startsWith('sk-') || openaiApiKey.length < 40) {
+        return res.status(400).json({ error: 'openaiApiKey must be a valid OpenAI API key' });
     }
 
     try {
-        console.log(`[ProxyRegister] Step 1: Preparing transaction (Version 4) for ${agentId}`);
+        console.log(`[ProxyRegister] Step 1: Preparing transaction (Version 5) for ${agentId}`);
         
-        // 1. Convert hex to bytes for the contract
-        const configHash = Buffer.from(configHashHex, 'hex');
-        
-        // 2. Map lane string/number to the required UInt64
-        const laneInt = typeof lane === 'string' ? 
-            (lane.toLowerCase() === 'research' ? 0 : lane.toLowerCase() === 'outreach' ? 1 : 2) : 
-            lane;
+        // 1. Encrypt Config for Vault
+        const vaultKeyHex = process.env.VAULT_KEY;
+        if (!vaultKeyHex || vaultKeyHex.length !== 64) {
+            throw new Error('Backend VAULT_KEY is not configured correctly (must be 64 hex chars)');
+        }
 
+        const configToEncrypt = {
+            lane,
+            llmTier,
+            biddingStrategy,
+            openai_api_key: openaiApiKey,
+            agent_address: agentId // agentId is used as the address/unique identifier
+        };
+
+        const vaultKey = Buffer.from(vaultKeyHex, 'hex');
+        const salt = Buffer.from('0rca_swarm_dojo_salt');
+        const derivedKey = crypto.pbkdf2Sync(vaultKey, salt, 100000, 32, 'sha256');
+        
+        const nonce = crypto.randomBytes(12);
+        const cipher = crypto.createCipheriv('aes-256-gcm', derivedKey, nonce);
+        
+        const ciphertext = Buffer.concat([
+            cipher.update(JSON.stringify(configToEncrypt), 'utf8'),
+            cipher.final()
+        ]);
+        const authTag = cipher.getAuthTag();
+        
+        // Format: base64(nonce + ciphertext + authTag)
+        // Python's cryptography AESGCM.encrypt puts the tag at the end of the ciphertext
+        const encryptedBlob = Buffer.concat([nonce, ciphertext, authTag]).toString('base64');
+
+        const vaultDir = path.join(process.cwd(), '../dojo-agents/vault');
+        if (!fs.existsSync(vaultDir)) {
+            fs.mkdirSync(vaultDir, { recursive: true });
+        }
+        
+        const vaultPath = path.join(vaultDir, `${agentId}.enc`);
+        fs.writeFileSync(vaultPath, encryptedBlob);
+        console.log(`[ProxyRegister] Step 2: Vault file written: ${vaultPath}`);
+
+        // 2. Map lane string to required UInt64 for contract
+        const laneInt = lane === 'RESEARCH' ? 0 : lane === 'OUTREACH' ? 1 : 2;
         const laneBigInt = BigInt(laneInt);
+        
+        // 3. Mock config hash for the contract (the actual config is in the vault)
+        const configHash = crypto.createHash('sha256').update(encryptedBlob).digest();
         
         console.log(`[ProxyRegister] Step 2: lane=${laneBigInt}, sensei=${senseiAddress}`);
 
@@ -100,16 +154,16 @@ router.post('/register', async (req, res) => {
             where: { id: agentId },
             update: {
                 senseiAddress,
-                lane: lane.toString().toUpperCase(),
-                configHash: configHashHex,
+                lane: lane.toUpperCase(),
+                configHash: configHash.toString('hex'),
                 status: AgentStatus.ACTIVE
             },
             create: {
                 id: agentId,
                 address: agentId, 
                 senseiAddress,
-                lane: lane.toString().toUpperCase(),
-                configHash: configHashHex,
+                lane: lane.toUpperCase(),
+                configHash: configHash.toString('hex'),
                 status: AgentStatus.ACTIVE,
                 tasksCompleted: BigInt(0),
                 totalEarnedUsdc: BigInt(0)
