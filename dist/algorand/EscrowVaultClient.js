@@ -90,8 +90,8 @@ class EscrowVaultParamsFactory {
     static releasePayment(params) {
         return {
             ...params,
-            method: 'release_payment(string)bool',
-            args: Array.isArray(params.args) ? params.args : [params.args.taskId],
+            method: 'release_payment(string,address)bool',
+            args: Array.isArray(params.args) ? params.args : [params.args.taskId, params.args.treasury],
         };
     }
     /**
@@ -107,6 +107,21 @@ class EscrowVaultParamsFactory {
             ...params,
             method: 'slash_collateral(string,address)bool',
             args: Array.isArray(params.args) ? params.args : [params.args.taskId, params.args.treasury],
+        };
+    }
+    /**
+     * Constructs a no op call for the submit_task(string,byte[])bool ABI method
+     *
+     * Worker submits task results hash.
+     *
+     * @param params Parameters for the call
+     * @returns An `AppClientMethodCallParams` object for the call
+     */
+    static submitTask(params) {
+        return {
+            ...params,
+            method: 'submit_task(string,byte[])bool',
+            args: Array.isArray(params.args) ? params.args : [params.args.taskId, params.args.kiteHash],
         };
     }
     /**
@@ -354,7 +369,7 @@ class EscrowVaultClient {
             return this.appClient.params.call(EscrowVaultParamsFactory.lockCollateral(params));
         },
         /**
-         * Makes a call to the EscrowVault smart contract using the `release_payment(string)bool` ABI method.
+         * Makes a call to the EscrowVault smart contract using the `release_payment(string,address)bool` ABI method.
          *
          * Admin releases bounty to worker on validated completion.
          *
@@ -374,6 +389,17 @@ class EscrowVaultClient {
          */
         slashCollateral: (params) => {
             return this.appClient.params.call(EscrowVaultParamsFactory.slashCollateral(params));
+        },
+        /**
+         * Makes a call to the EscrowVault smart contract using the `submit_task(string,byte[])bool` ABI method.
+         *
+         * Worker submits task results hash.
+         *
+         * @param params The params for the smart contract call
+         * @returns The call params
+         */
+        submitTask: (params) => {
+            return this.appClient.params.call(EscrowVaultParamsFactory.submitTask(params));
         },
         /**
          * Makes a call to the EscrowVault smart contract using the `get_task(string)byte[]` ABI method.
@@ -425,7 +451,7 @@ class EscrowVaultClient {
             return this.appClient.createTransaction.call(EscrowVaultParamsFactory.lockCollateral(params));
         },
         /**
-         * Makes a call to the EscrowVault smart contract using the `release_payment(string)bool` ABI method.
+         * Makes a call to the EscrowVault smart contract using the `release_payment(string,address)bool` ABI method.
          *
          * Admin releases bounty to worker on validated completion.
          *
@@ -445,6 +471,17 @@ class EscrowVaultClient {
          */
         slashCollateral: (params) => {
             return this.appClient.createTransaction.call(EscrowVaultParamsFactory.slashCollateral(params));
+        },
+        /**
+         * Makes a call to the EscrowVault smart contract using the `submit_task(string,byte[])bool` ABI method.
+         *
+         * Worker submits task results hash.
+         *
+         * @param params The params for the smart contract call
+         * @returns The call transaction
+         */
+        submitTask: (params) => {
+            return this.appClient.createTransaction.call(EscrowVaultParamsFactory.submitTask(params));
         },
         /**
          * Makes a call to the EscrowVault smart contract using the `get_task(string)byte[]` ABI method.
@@ -498,7 +535,7 @@ class EscrowVaultClient {
             return { ...result, return: result.return };
         },
         /**
-         * Makes a call to the EscrowVault smart contract using the `release_payment(string)bool` ABI method.
+         * Makes a call to the EscrowVault smart contract using the `release_payment(string,address)bool` ABI method.
          *
          * Admin releases bounty to worker on validated completion.
          *
@@ -519,6 +556,18 @@ class EscrowVaultClient {
          */
         slashCollateral: async (params) => {
             const result = await this.appClient.send.call(EscrowVaultParamsFactory.slashCollateral(params));
+            return { ...result, return: result.return };
+        },
+        /**
+         * Makes a call to the EscrowVault smart contract using the `submit_task(string,byte[])bool` ABI method.
+         *
+         * Worker submits task results hash.
+         *
+         * @param params The params for the smart contract call
+         * @returns The call result
+         */
+        submitTask: async (params) => {
+            const result = await this.appClient.send.call(EscrowVaultParamsFactory.submitTask(params));
             return { ...result, return: result.return };
         },
         /**
@@ -619,7 +668,7 @@ class EscrowVaultClient {
              */
             releasePayment(params) {
                 promiseChain = promiseChain.then(async () => composer.addAppCallMethodCall(await client.params.releasePayment(params)));
-                resultMappers.push((v) => client.decodeReturnValue('release_payment(string)bool', v));
+                resultMappers.push((v) => client.decodeReturnValue('release_payment(string,address)bool', v));
                 return this;
             },
             /**
@@ -628,6 +677,14 @@ class EscrowVaultClient {
             slashCollateral(params) {
                 promiseChain = promiseChain.then(async () => composer.addAppCallMethodCall(await client.params.slashCollateral(params)));
                 resultMappers.push((v) => client.decodeReturnValue('slash_collateral(string,address)bool', v));
+                return this;
+            },
+            /**
+             * Add a submit_task(string,byte[])bool method call against the EscrowVault contract
+             */
+            submitTask(params) {
+                promiseChain = promiseChain.then(async () => composer.addAppCallMethodCall(await client.params.submitTask(params)));
+                resultMappers.push((v) => client.decodeReturnValue('submit_task(string,byte[])bool', v));
                 return this;
             },
             /**

@@ -4,7 +4,7 @@
   "description": "Coordination layer for 0rca Swarm Dojo",
   "main": "dist/index.js",
   "scripts": {
-    "dev": "nodemon --exec 'ts-node --transpile-only' src/index.ts",
+    "dev": "nodemon --exec npx ts-node --transpile-only src/index.ts",
     "sync": "ts-node src/scripts/sync.ts",
     "build": "tsc",
     "start": "node dist/index.js",

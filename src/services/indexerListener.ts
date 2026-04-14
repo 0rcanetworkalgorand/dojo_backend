@@ -229,12 +229,25 @@ export class IndexerListener {
             } else if (method.name === 'release_payment') {
                 const [taskId] = args;
                 const taskIdStr = typeof taskId === 'string' ? taskId : Buffer.from(taskId as Uint8Array).toString('utf-8');
-                const task = await prisma.task.update({
+                
+                // 1. Fetch task to get agent attribution
+                const task = await prisma.task.findUnique({
                     where: { id: taskIdStr },
-                    data: { state: TaskState.SETTLED, settledAt: new Date() }
+                    include: { agent: true }
                 });
-                console.log(`[Indexer] ✅ Payment Released for Task: ${taskIdStr}`);
-                this.broadcastEvent('TASK_SETTLED', task);
+
+                if (task && task.state !== TaskState.SETTLED) {
+                    console.log(`[Indexer] Processing Payment Release for Task: ${taskIdStr}...`);
+                    
+                    // 2. Update Task state
+                    await prisma.task.update({
+                        where: { id: taskIdStr },
+                        data: { state: TaskState.SETTLED, settledAt: new Date() }
+                    });
+
+                    console.log(`[Indexer] ✅ Payment Released for Task: ${taskIdStr}`);
+                    this.broadcastEvent('TASK_SETTLED', { ...task, state: TaskState.SETTLED });
+                }
             }
         } catch (e: any) {
             console.error('[Indexer] Escrow decode error:', e.message || e);
@@ -273,7 +286,7 @@ export class IndexerListener {
                             where: { id: agentId },
                             update: {
                                 address: agentId, // agentId is the unique identifier
-                                status: statusRaw === 1 ? AgentStatus.ACTIVE : AgentStatus.INACTIVE,
+                                status: (statusRaw === 0 || statusRaw === 1) ? AgentStatus.ACTIVE : AgentStatus.INACTIVE,
                                 lane: this.mapLane(laneRaw),
                                 configHash,
                                 tasksCompleted: BigInt(tasksCompleted),
@@ -283,7 +296,7 @@ export class IndexerListener {
                                 id: agentId,
                                 address: agentId,
                                 senseiAddress: senseiAddr,
-                                status: statusRaw === 1 ? AgentStatus.ACTIVE : AgentStatus.INACTIVE,
+                                status: (statusRaw === 0 || statusRaw === 1) ? AgentStatus.ACTIVE : AgentStatus.INACTIVE,
                                 lane: this.mapLane(laneRaw),
                                 configHash,
                                 tasksCompleted: BigInt(tasksCompleted),
@@ -293,8 +306,8 @@ export class IndexerListener {
                         broadcast('AGENT_REGISTERED', {
                             address: senseiAddr,
                             agentId: agentId,
-                            lane: laneRaw,
-                            status: statusRaw,
+                            lane: this.mapLane(laneRaw),
+                            status: (statusRaw === 0 || statusRaw === 1) ? AgentStatus.ACTIVE : AgentStatus.INACTIVE,
                             configHash
                         });
                     }

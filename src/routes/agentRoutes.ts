@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
 import { AgentStatus } from '../lib/types';
-import { registryClient } from '../algorand/contracts';
+import { registryClient, adminAddress, signer } from '../algorand/contracts';
+import algosdk from 'algosdk';
 import { microAlgos } from '@algorandfoundation/algokit-utils';
 import crypto from 'crypto';
 import fs from 'fs';
@@ -14,7 +15,7 @@ router.get('/', async (req, res) => {
     const { lane, sensei } = req.query;
     const where: any = {};
     if (lane) where.lane = (lane as string).toUpperCase();
-    if (sensei) where.senseiAddress = sensei as string;
+    if (sensei) where.senseiAddress = (sensei as string).toUpperCase();
 
     try {
         let agents = await prisma.agent.findMany({
@@ -23,7 +24,9 @@ router.get('/', async (req, res) => {
 
         const mapped = agents.map(a => {
             const successRate = 100; // Default until failure tracking is active
-            const totalEarned = Number(a.totalEarnedUsdc) / 1_000_000;
+            
+            // Keep in microAlgos (base units) so frontend formatters work correctly
+            const totalEarned = Number(a.totalEarnedUsdc); 
             
             return {
                 ...a,
@@ -61,8 +64,11 @@ router.post('/register', async (req, res) => {
     if (!validStrategies.includes(biddingStrategy)) {
         return res.status(400).json({ error: `biddingStrategy must be one of: ${validStrategies.join(', ')}` });
     }
-    if (!openaiApiKey || !openaiApiKey.startsWith('sk-') || openaiApiKey.length < 40) {
-        return res.status(400).json({ error: 'openaiApiKey must be a valid OpenAI API key' });
+    const isGroq = openaiApiKey && openaiApiKey.startsWith('gsk_');
+    const isOpenAI = openaiApiKey && openaiApiKey.startsWith('sk-');
+
+    if (!openaiApiKey || (!isGroq && !isOpenAI) || openaiApiKey.length < 30) {
+        return res.status(400).json({ error: 'llmApiKey must be a valid OpenAI (sk-) or Groq (gsk_) key' });
     }
 
     try {
@@ -109,36 +115,55 @@ router.post('/register', async (req, res) => {
         console.log(`[ProxyRegister] Step 2: Vault file written: ${vaultPath}`);
 
         // 2. Map lane string to required UInt64 for contract
-        const laneInt = lane === 'RESEARCH' ? 0 : lane === 'OUTREACH' ? 1 : 2;
-        const laneBigInt = BigInt(laneInt);
+        // Lane enum: 0=RESEARCH, 1=CODE, 2=DATA, 3=OUTREACH
+        const laneMap: Record<string, number> = {
+            'RESEARCH': 0,
+            'CODE': 1,
+            'DATA': 2,
+            'OUTREACH': 3
+        };
+        const laneInt = laneMap[lane] ?? 0;
+        const laneBigInt = BigInt(laneInt); // UInt64 for contract
         
         // 3. Mock config hash for the contract (the actual config is in the vault)
         const configHash = crypto.createHash('sha256').update(encryptedBlob).digest();
         
-        console.log(`[ProxyRegister] Step 2: lane=${laneBigInt}, sensei=${senseiAddress}`);
+        console.log(`[ProxyRegister] Step 2: lane=${laneInt}, sensei=${senseiAddress}`);
 
-        // 3. Attempt on-chain registration
+        // 3. Attempt on-chain registration and fund contract with 200k microAlgos for MBR
         let txId = 'already-on-chain';
         try {
             const suggestedParams = await registryClient.algorand.client.algod.getTransactionParams().do();
             const baseFee = BigInt(suggestedParams.fee || 1000);
+            
+            // Mitigate algokit-utils bug expecting `transaction.from.publicKey` on v2 Transaction objects
+            // by explicitly passing the signer into a 0-ALGO dummy transaction in the group.
+            const dummyTxn = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
+                sender: adminAddress,
+                receiver: adminAddress,
+                amount: 0,
+                suggestedParams
+            });
 
-            const result = await registryClient.newGroup().registerAgent({
-                args: {
-                    agentId,
-                    sensei: senseiAddress,
-                    lane: laneBigInt,
-                    configHash: new Uint8Array(configHash)
-                },
-                boxReferences: [
-                    new Uint8Array(Buffer.from(agentId))
-                ],
-                staticFee: microAlgos(baseFee)
-            }).send();
+            const result = await registryClient.newGroup()
+                .addTransaction(dummyTxn, signer)
+                .registerAgent({
+                    args: {
+                        agentId,
+                        sensei: senseiAddress,
+                        lane: laneBigInt,
+                        configHash: new Uint8Array(configHash)
+                    },
+                    boxReferences: [
+                        new Uint8Array(Buffer.from(agentId))
+                    ],
+                    staticFee: microAlgos(baseFee)
+                }).send({ maxRoundsToWaitForConfirmation: 10 });
 
             txId = result.txIds[0];
             console.log(`[ProxyRegister] Step 3: On-chain txn successful. Tx: ${txId}`);
         } catch (chainErr: any) {
+            console.error('Registration failed with error:', chainErr.stack || chainErr);
             const errMsg = chainErr?.message || '';
             // pc=178 is "Agent already registered" in the contract
             if (errMsg.includes('pc=178') || errMsg.includes('Agent already registered')) {
@@ -189,7 +214,8 @@ router.post('/register', async (req, res) => {
 
 // Get user/agent stats
 router.get('/stats/:address', async (req, res) => {
-    const { address } = req.params;
+    const { address: rawAddress } = req.params;
+    const address = rawAddress.toUpperCase(); // Normalize for case-sensitive lookups
     try {
         let agents = await prisma.agent.findMany({
             where: { senseiAddress: address }
@@ -211,7 +237,8 @@ router.get('/stats/:address', async (req, res) => {
             tasksToday: tasks.filter(t => t.createdAt > new Date(Date.now() - 86400000)).length,
             usdcVolume: agents.reduce((sum, a) => sum + Number(a.totalEarnedUsdc), 0),
         };
-
+        
+        console.log(`[Stats API] Returning stats for ${address}:`, stats);
         res.json(stats);
     } catch (err) {
         console.error('[agentRoutes] Stats fetch error:', err);

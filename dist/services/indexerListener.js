@@ -5,7 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.IndexerListener = void 0;
 const algosdk_1 = __importDefault(require("algosdk"));
-const client_1 = require("@prisma/client");
+const types_1 = require("../lib/types");
 const prisma_1 = require("../lib/prisma");
 const contracts_1 = require("../algorand/contracts");
 const executionManager_1 = require("./executionManager");
@@ -42,36 +42,75 @@ class IndexerListener {
             }
         }
         catch (err) {
-            console.warn('[Indexer] Could not load cursor, starting from current tip');
+            console.error('[Indexer] DATABASE CONNECTION ERROR: Could not load cursor. Please check your database connection.');
+            console.warn('[Indexer] Continuing with cursor = current tip to allow partial functionality...');
         }
         // One-time sync of current on-chain state
         console.log('🔄 Syncing existing agents from blockchain boxes...');
         try {
             await this.syncExistingAgents();
-            console.log('✅ Initial Sync completed. Indexer in SLEEP mode to preserve connections.');
-            // Prevent further polling to save connections
-            while (true) {
-                await new Promise(r => setTimeout(r, 3600000));
-            }
+            console.log('✅ Initial Sync completed. Switching to LIVE block polling...');
+            // Start the polling loop
+            this.poll();
         }
         catch (error) {
             console.error('[Indexer] Sync/Polling loop crashed:', error);
         }
     }
+    async poll() {
+        while (this.isRunning) {
+            try {
+                const status = await contracts_1.algorand.client.algod.status().do();
+                const currentRound = Number(status['last-round']);
+                // If this is first run and lastBlock is 0, start from current tip
+                if (this.lastBlock === 0) {
+                    this.lastBlock = currentRound;
+                }
+                while (this.lastBlock < currentRound) {
+                    this.lastBlock++;
+                    await this.processBlock(this.lastBlock);
+                    try {
+                        // Update cursor in DB
+                        await prisma_1.prisma.indexerCursor.upsert({
+                            where: { id: 1 },
+                            update: { lastRound: BigInt(this.lastBlock) },
+                            create: { id: 1, lastRound: BigInt(this.lastBlock) }
+                        });
+                    }
+                    catch (dbErr) {
+                        console.error(`[Indexer] Failed to update cursor in DB at round ${this.lastBlock}:`, dbErr.message);
+                    }
+                }
+            }
+            catch (err) {
+                console.error('[Indexer] Polling error:', err);
+            }
+            // Wait 2 seconds before next poll (Algorand block time is ~2.8s-3.3s)
+            await new Promise(r => setTimeout(r, 2000));
+        }
+    }
     async processBlock(round) {
         try {
+            // Fetch block with 'msgpack' format (standard for SDK v3)
             const blockResponse = await contracts_1.algorand.client.algod.block(round).do();
-            const txns = blockResponse.block.txns || [];
+            // Handle different block structures depending on node/SDK version
+            const txns = blockResponse?.block?.txns || blockResponse?.block?.transactions || [];
             for (const txn of txns) {
-                const dt = txn.txn;
-                if (dt.type === 'appl') {
-                    const appId = dt.apid || 0;
-                    if (Number(appId) === this.registryAppId) {
-                        await this.handleRegistryCall(txn);
+                try {
+                    // Extract transaction data - handle both msgpack and JSON-like structures
+                    const dt = txn.txn || txn;
+                    if (dt.type === 'appl') {
+                        const appId = dt.apid || dt.apaid || 0;
+                        if (Number(appId) === this.registryAppId) {
+                            await this.handleRegistryCall(txn);
+                        }
+                        else if (Number(appId) === this.escrowAppId) {
+                            await this.handleEscrowCall(txn);
+                        }
                     }
-                    else if (Number(appId) === this.escrowAppId) {
-                        await this.handleEscrowCall(txn);
-                    }
+                }
+                catch (txnErr) {
+                    console.error(`[Indexer] Error parsing transaction in block ${round}:`, txnErr);
                 }
             }
         }
@@ -80,7 +119,8 @@ class IndexerListener {
         }
     }
     async handleRegistryCall(txn) {
-        const apaa = txn.txn.apaa;
+        // Handle both possible locations for apaa depending on how block was decoded
+        const apaa = txn.txn?.apaa || txn.apaa;
         if (!apaa || apaa.length === 0)
             return;
         const selector = Buffer.from(apaa[0]).toString('hex');
@@ -89,42 +129,51 @@ class IndexerListener {
             return;
         try {
             const abiMethod = new algosdk_1.default.ABIMethod(method);
+            // Ensure args are Uint8Arrays for decodeMethodArgs
             const args = abiMethod.decodeMethodArgs(apaa.slice(1).map((a) => new Uint8Array(a)));
             if (method.name === 'register_agent') {
                 const [agentId, sensei, lane, configHash] = args;
+                const agentIdStr = typeof agentId === 'string' ? agentId : Buffer.from(agentId).toString('utf-8');
+                const senseiAddr = sensei.toString();
+                console.log(`[Indexer] Processing Registration: ${agentIdStr}...`);
                 const agent = await prisma_1.prisma.agent.upsert({
-                    where: { address: sensei.toString() },
+                    where: { id: agentIdStr },
                     update: {
-                        status: client_1.AgentStatus.ACTIVE,
+                        status: types_1.AgentStatus.ACTIVE,
                         lane: this.mapLane(Number(lane)),
                         configHash: Buffer.from(configHash).toString('hex')
                     },
                     create: {
-                        id: agentId.toString(),
-                        address: sensei.toString(),
-                        senseiAddress: sensei.toString(),
+                        id: agentIdStr,
+                        address: agentIdStr,
+                        senseiAddress: senseiAddr,
                         lane: this.mapLane(Number(lane)),
                         configHash: Buffer.from(configHash).toString('hex'),
-                        status: client_1.AgentStatus.ACTIVE
+                        status: types_1.AgentStatus.ACTIVE,
+                        tasksCompleted: BigInt(0),
+                        totalEarnedUsdc: BigInt(0)
                     }
                 });
+                console.log(`[Indexer] ✅ Registered Agent: ${agentIdStr} (Sensei: ${senseiAddr})`);
                 this.broadcastEvent('AGENT_REGISTERED', agent);
             }
             else if (method.name === 'update_status') {
                 const [agentId, active] = args;
+                const agentIdStr = typeof agentId === 'string' ? agentId : Buffer.from(agentId).toString('utf-8');
                 const agent = await prisma_1.prisma.agent.update({
-                    where: { id: agentId.toString() },
-                    data: { status: active ? client_1.AgentStatus.ACTIVE : client_1.AgentStatus.INACTIVE }
+                    where: { id: agentIdStr },
+                    data: { status: active ? types_1.AgentStatus.ACTIVE : types_1.AgentStatus.INACTIVE }
                 });
+                console.log(`[Indexer] Status Updated: ${agentIdStr} -> ${active ? 'ACTIVE' : 'INACTIVE'}`);
                 this.broadcastEvent('AGENT_STATUS_UPDATED', agent);
             }
         }
         catch (e) {
-            console.error('[Indexer] Registry decode error:', e);
+            console.error('[Indexer] Registry decode error:', e.message || e);
         }
     }
     async handleEscrowCall(txn) {
-        const apaa = txn.txn.apaa;
+        const apaa = txn.txn?.apaa || txn.apaa;
         if (!apaa || apaa.length === 0)
             return;
         const selector = Buffer.from(apaa[0]).toString('hex');
@@ -136,10 +185,12 @@ class IndexerListener {
             const args = abiMethod.decodeMethodArgs(apaa.slice(1).map((a) => new Uint8Array(a)));
             if (method.name === 'lock_bounty') {
                 const [taskId, client, worker, bounty, collateral, deadline] = args;
+                const taskIdStr = typeof taskId === 'string' ? taskId : Buffer.from(taskId).toString('utf-8');
+                console.log(`[Indexer] Processing Task Lock: ${taskIdStr}...`);
                 const task = await prisma_1.prisma.task.upsert({
-                    where: { id: taskId.toString() },
+                    where: { id: taskIdStr },
                     update: {
-                        state: client_1.TaskState.LOCKED,
+                        state: types_1.TaskState.LOCKED,
                         bountyUsdc: BigInt(bounty.toString()),
                         collateralUsdc: BigInt(collateral.toString()),
                         clientAddress: client.toString(),
@@ -147,16 +198,17 @@ class IndexerListener {
                         deadline: new Date(Number(deadline) * 1000)
                     },
                     create: {
-                        id: taskId.toString(),
-                        state: client_1.TaskState.LOCKED,
+                        id: taskIdStr,
+                        state: types_1.TaskState.LOCKED,
                         bountyUsdc: BigInt(bounty.toString()),
                         collateralUsdc: BigInt(collateral.toString()),
                         clientAddress: client.toString(),
                         workerAddress: worker.toString(),
-                        lane: client_1.LaneType.RESEARCH, // Default
+                        lane: types_1.LaneType.RESEARCH, // Default
                         deadline: new Date(Number(deadline) * 1000)
                     }
                 });
+                console.log(`[Indexer] ✅ Task Locked: ${taskIdStr} (Worker: ${worker.toString()})`);
                 this.broadcastEvent('TASK_LOCKED', task);
                 // Trigger Agent Execution!
                 if (task.agentId && task.workerAddress) {
@@ -170,20 +222,22 @@ class IndexerListener {
             }
             else if (method.name === 'release_payment') {
                 const [taskId] = args;
+                const taskIdStr = typeof taskId === 'string' ? taskId : Buffer.from(taskId).toString('utf-8');
                 const task = await prisma_1.prisma.task.update({
-                    where: { id: taskId.toString() },
-                    data: { state: client_1.TaskState.SETTLED, settledAt: new Date() }
+                    where: { id: taskIdStr },
+                    data: { state: types_1.TaskState.SETTLED, settledAt: new Date() }
                 });
+                console.log(`[Indexer] ✅ Payment Released for Task: ${taskIdStr}`);
                 this.broadcastEvent('TASK_SETTLED', task);
             }
         }
         catch (e) {
-            console.error('[Indexer] Escrow decode error:', e);
+            console.error('[Indexer] Escrow decode error:', e.message || e);
         }
     }
     mapLane(lane) {
-        const lanes = [client_1.LaneType.RESEARCH, client_1.LaneType.CODE, client_1.LaneType.DATA, client_1.LaneType.OUTREACH];
-        return lanes[lane] || client_1.LaneType.RESEARCH;
+        const lanes = [types_1.LaneType.RESEARCH, types_1.LaneType.CODE, types_1.LaneType.DATA, types_1.LaneType.OUTREACH];
+        return lanes[lane] || types_1.LaneType.RESEARCH;
     }
     broadcastEvent(type, payload) {
         const serialized = JSON.parse(JSON.stringify(payload, (_, v) => typeof v === 'bigint' ? v.toString() : v));
@@ -205,9 +259,10 @@ class IndexerListener {
                         const configHash = Buffer.from(value.slice(41, 73)).toString('hex');
                         const tasksCompleted = algosdk_1.default.decodeUint64(value.slice(73, 81), 'bigint');
                         await prisma_1.prisma.agent.upsert({
-                            where: { address: senseiAddr },
+                            where: { id: agentId },
                             update: {
-                                status: statusRaw === 1 ? client_1.AgentStatus.ACTIVE : client_1.AgentStatus.INACTIVE,
+                                address: agentId, // agentId is the unique identifier
+                                status: statusRaw === 1 ? types_1.AgentStatus.ACTIVE : types_1.AgentStatus.INACTIVE,
                                 lane: this.mapLane(laneRaw),
                                 configHash,
                                 tasksCompleted: BigInt(tasksCompleted),
@@ -215,9 +270,9 @@ class IndexerListener {
                             },
                             create: {
                                 id: agentId,
-                                address: senseiAddr,
+                                address: agentId,
                                 senseiAddress: senseiAddr,
-                                status: statusRaw === 1 ? client_1.AgentStatus.ACTIVE : client_1.AgentStatus.INACTIVE,
+                                status: statusRaw === 1 ? types_1.AgentStatus.ACTIVE : types_1.AgentStatus.INACTIVE,
                                 lane: this.mapLane(laneRaw),
                                 configHash,
                                 tasksCompleted: BigInt(tasksCompleted),

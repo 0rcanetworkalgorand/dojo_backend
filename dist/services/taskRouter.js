@@ -1,7 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.TaskRouter = void 0;
-const client_1 = require("@prisma/client");
+const types_1 = require("../lib/types");
 const prisma_1 = require("../lib/prisma");
 const executionManager_1 = require("./executionManager");
 class TaskRouter {
@@ -24,7 +24,7 @@ class TaskRouter {
         const candidates = await prisma_1.prisma.agent.findMany({
             where: {
                 lane: targetLane,
-                status: client_1.AgentStatus.LISTED,
+                status: types_1.AgentStatus.LISTED,
             }
         });
         // Step 4 — If no candidates exist in the database, throw an error
@@ -36,15 +36,20 @@ class TaskRouter {
             const totalTasks = candidate.tasksCompleted + candidate.tasksFailed;
             const successRate = totalTasks > 0n
                 ? Number(candidate.tasksCompleted) / Number(totalTasks)
-                : 0.5; // default 50% for new agents with no history
-            const taskCountWeight = Math.min(Number(candidate.tasksCompleted) / 100, 1.0);
-            // caps at 100 tasks — after that, volume weight is maxed
-            const score = (successRate * 0.7) + (taskCountWeight * 0.3);
-            // 70% weight on success rate, 30% weight on task volume
+                : 0.8; // default 80% for new agents to give them a chance
+            const taskCountWeight = Math.min(Number(candidate.tasksCompleted) / 500, 1.0);
+            // Bidding Strategy Simulation:
+            // Volume strategy (lower bids) gets a bonus on selection probability
+            // Margin strategy (higher bids) is more selective but harder to win
+            // For now, we simulate this with a "bid efficiency" factor
+            const strategyBonus = candidate.tasksCompleted > 100n ? 0.1 : 0.0; // Experience bonus
+            // Final Score: 60% Success Rate, 20% Volume, 20% Reliability
+            const reliabilityScore = candidate.tasksFailed === 0n ? 1.0 : (1.0 / (Number(candidate.tasksFailed) + 1));
+            const score = (successRate * 0.6) + (taskCountWeight * 0.2) + (reliabilityScore * 0.2) + strategyBonus;
             return { candidate, score, successRate };
         });
-        // Step 3 — Sort candidates by score descending. Select the top candidate.
-        scoredCandidates.sort((a, b) => b.score - a.score);
+        // Step 3 — Sort candidates by score descending with slight randomness to prevent monopoly
+        scoredCandidates.sort((a, b) => (b.score + Math.random() * 0.05) - (a.score + Math.random() * 0.05));
         const selected = scoredCandidates[0];
         const bestAgent = selected.candidate;
         // Step 5 — Log the selected agent and its score
@@ -54,7 +59,7 @@ class TaskRouter {
             data: {
                 agentId: bestAgent.id,
                 workerAddress: bestAgent.address,
-                state: client_1.TaskState.LOCKED
+                state: types_1.TaskState.LOCKED
             }
         });
         // 2. Dispatch to Agent Execution Manager

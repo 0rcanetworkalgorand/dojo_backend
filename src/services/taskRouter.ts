@@ -40,19 +40,26 @@ export class TaskRouter {
       const totalTasks = candidate.tasksCompleted + candidate.tasksFailed;
       const successRate = totalTasks > 0n
         ? Number(candidate.tasksCompleted) / Number(totalTasks)
-        : 0.5; // default 50% for new agents with no history
+        : 0.8; // default 80% for new agents to give them a chance
 
-      const taskCountWeight = Math.min(Number(candidate.tasksCompleted) / 100, 1.0);
-      // caps at 100 tasks — after that, volume weight is maxed
+      const taskCountWeight = Math.min(Number(candidate.tasksCompleted) / 500, 1.0);
+      
+      // Bidding Strategy Simulation:
+      // Volume strategy (lower bids) gets a bonus on selection probability
+      // Margin strategy (higher bids) is more selective but harder to win
+      // For now, we simulate this with a "bid efficiency" factor
+      const strategyBonus = candidate.tasksCompleted > 100n ? 0.1 : 0.0; // Experience bonus
 
-      const score = (successRate * 0.7) + (taskCountWeight * 0.3);
-      // 70% weight on success rate, 30% weight on task volume
+      // Final Score: 60% Success Rate, 20% Volume, 20% Reliability
+      const reliabilityScore = candidate.tasksFailed === 0n ? 1.0 : (1.0 / (Number(candidate.tasksFailed) + 1));
+      
+      const score = (successRate * 0.6) + (taskCountWeight * 0.2) + (reliabilityScore * 0.2) + strategyBonus;
       
       return { candidate, score, successRate };
     });
 
-    // Step 3 — Sort candidates by score descending. Select the top candidate.
-    scoredCandidates.sort((a, b) => b.score - a.score);
+    // Step 3 — Sort candidates by score descending with slight randomness to prevent monopoly
+    scoredCandidates.sort((a, b) => (b.score + Math.random() * 0.05) - (a.score + Math.random() * 0.05));
     const selected = scoredCandidates[0];
     const bestAgent = selected.candidate;
 

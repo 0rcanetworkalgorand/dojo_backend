@@ -1,29 +1,62 @@
-import { TaskState } from '../lib/types';
 import { prisma } from '../lib/prisma';
+import { registryClient } from '../algorand/contracts';
+import { AgentStatus, CommitmentStatus } from '../lib/types';
 
 export const startCommitmentWatcher = () => {
-  // Check for expired commitments every 24 hours (86400000ms)
+  // Check for expired commitments every 12 hours
   setInterval(async () => {
-    console.log('Running daily commitment expiry check...');
+    console.log('[CommitmentWatcher] Running identity expiry check...');
     
-    // Find tasks that haven't been submitted before deadline
-    // Using the new schema 'state' and 'deadline' fields
-    const expiredTasks = await prisma.task.findMany({
+    // 1. Find natural expirations (lockExpiry passed and still ACTIVE)
+    const expiredCommitments = await prisma.commitment.findMany({
       where: {
-        state: TaskState.LOCKED,
-        deadline: {
+        status: CommitmentStatus.ACTIVE,
+        lockExpiry: {
           lt: new Date()
         }
+      },
+      include: { agent: true }
+    });
+
+    for (const commitment of expiredCommitments) {
+      console.log(`[CommitmentWatcher] Commitment ${commitment.id} expired for agent ${commitment.agent.address}. Delisting...`);
+      
+      try {
+        // Trigger on-chain delisting
+        await registryClient.send.delistAgent({ 
+          args: { agentId: commitment.agentId } 
+        });
+
+        // Update database states
+        await prisma.$transaction([
+          prisma.commitment.update({
+            where: { id: commitment.id },
+            data: { status: CommitmentStatus.EXPIRED }
+          }),
+          prisma.agent.update({
+            where: { id: commitment.agentId },
+            data: { status: AgentStatus.INACTIVE }
+          })
+        ]);
+        
+        console.log(`[CommitmentWatcher] Successfully delisted ${commitment.agent.address}`);
+      } catch (err) {
+        console.error(`[CommitmentWatcher] Failed to delist ${commitment.id}:`, err);
+      }
+    }
+
+    // 2. Task Expiry (Optional, but good for cleanup)
+    const staleTasks = await prisma.task.findMany({
+      where: {
+        state: 'LOCKED',
+        deadline: { lt: new Date() }
       }
     });
 
-    for (const task of expiredTasks) {
-      console.log(`Slashing collateral for expired task ${task.id}`);
-      // In a real scenario, this would trigger an on-chain slash via VerificationService
-      await prisma.task.update({
-        where: { id: task.id },
-        data: { state: TaskState.SLASHED }
-      });
+    for (const task of staleTasks) {
+       console.log(`[CommitmentWatcher] Task ${task.id} deadline passed. Suggesting slash...`);
+       // Note: Slashing usually requires admin signature, similar to VerificationService
     }
-  }, 24 * 60 * 60 * 1000);
+
+  }, 12 * 60 * 60 * 1000);
 };

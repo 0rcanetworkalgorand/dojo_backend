@@ -1,5 +1,5 @@
 import { EscrowVaultClient } from '../algorand/EscrowVaultClient';
-import { escrowClient, adminAddress } from '../algorand/contracts';
+import { escrowClient, registryClient, adminAddress } from '../algorand/contracts';
 import { TaskState } from '../lib/types';
 import { prisma } from '../lib/prisma';
 
@@ -7,21 +7,46 @@ export class VerificationService {
   /**
    * Verify a task result using real Kite AI and perform on-chain settlement or slashing.
    */
+  /**
+   * Verify a task result using real Kite AI and perform on-chain settlement or slashing.
+   */
   static async verifyAndSettle(taskId: string, provenanceHash: string, result: any) {
     console.log(`[VerificationService] Starting verification for task ${taskId}`);
 
-    // 1. Call Kite AI for verification
+    // 1. Fetch Task and associated Agent for metadata
+    const task = await prisma.task.findUnique({
+      where: { id: taskId },
+      include: { agent: true }
+    });
+
+    if (!task) {
+      console.error(`[VerificationService] Task ${taskId} not found in database.`);
+      return;
+    }
+
+    // 2. Call Kite AI for verification
     const kiteResult = await this.callKiteAI(provenanceHash, taskId);
 
-    // 2. Settlement logic
-    const treasury = process.env.NEXT_PUBLIC_TREASURY_ADDRESS || adminAddress;
+    // 3. Settlement logic
+    const treasury = process.env.TREASURY_ADDRESS || adminAddress;
+    const agentId = task.agentId;
 
-    // 3. Handle verification results and trigger on-chain actions
+    // 4. Handle verification results and trigger on-chain actions
     if (kiteResult.valid) {
       console.log(`[VerificationService] Kite AI returned valid=true for task ${taskId}`);
       try {
-        // Perform on-chain settlement
-        await escrowClient.send.releasePayment({ args: { taskId } });
+        // Perform on-chain settlement with platform fee (2% handled in contract)
+        // We pass treasury to the updated releasePayment method
+        await escrowClient.send.releasePayment({ 
+          args: { taskId, treasury } 
+        });
+
+        // Increment successful tasks in Registry
+        if (task.agent?.address) {
+          await registryClient.send.incrementTasks({ 
+            args: { agentId: task.agentId! }
+          });
+        }
 
         // Update task state on successful settlement
         await prisma.task.update({
@@ -32,6 +57,20 @@ export class VerificationService {
             settledAt: new Date()
           }
         });
+
+        // Update Agent stats in DB
+        if (agentId) {
+          const fee = (task.bountyUsdc * BigInt(200)) / BigInt(10000);
+          const earned = task.bountyUsdc - fee;
+          await prisma.agent.update({
+            where: { id: agentId },
+            data: {
+              tasksCompleted: { increment: 1 },
+              totalEarnedUsdc: { increment: earned }
+            }
+          });
+        }
+        
         console.log(`[VerificationService] Task ${taskId} successfully settled on-chain.`);
       } catch (error) {
         console.error(`[VerificationService] ERROR: On-chain settlement (verifyAndSettle) failed for task ${taskId}:`, error);
@@ -44,7 +83,16 @@ export class VerificationService {
       console.warn(`[VerificationService] Kite validation failed for task ${taskId}. Triggering slashWorker. Reason: ${kiteResult.error ?? 'invalid hash'}`);
       try {
         // Perform on-chain slashing
-        await escrowClient.send.slashCollateral({ args: { taskId, treasury } });
+        await escrowClient.send.slashCollateral({ 
+          args: { taskId, treasury } 
+        });
+
+        // Increment failed tasks in Registry
+        if (task.agent?.address) {
+          await registryClient.send.incrementTasksFailed({ 
+            args: { agentId: task.agentId! }
+          });
+        }
 
         // Update task state on successful slashing
         await prisma.task.update({
@@ -55,6 +103,16 @@ export class VerificationService {
             settledAt: new Date()
           }
         });
+
+        // Update Agent stats in DB
+        if (agentId) {
+          await prisma.agent.update({
+            where: { id: agentId },
+            data: {
+              tasksFailed: { increment: 1 }
+            }
+          });
+        }
         console.log(`[VerificationService] Task ${taskId} successfully slashed on-chain.`);
       } catch (error) {
         console.error(`[VerificationService] ERROR: On-chain slashing (slashWorker) failed for task ${taskId}:`, error);
