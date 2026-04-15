@@ -337,7 +337,7 @@ export class PayoutSplitterFactory {
   }
   
   /** A reference to the underlying `AlgorandClient` this app factory is using. */
-  public get algorand(): AlgorandClient {
+  public get algorand(): any {
     return this.appFactory.algorand
   }
   
@@ -532,7 +532,7 @@ export class PayoutSplitterClient {
   }
   
   /** A reference to the underlying `AlgorandClient` this app client is using. */
-  public get algorand(): AlgorandClient {
+  public get algorand(): any {
     return this.appClient.algorand
   }
 

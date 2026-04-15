@@ -157,7 +157,7 @@ export class TaskExecutor {
             try {
                 // Call regular EscrowVault contract to release payment
                 // Using adminAddress as treasury for the 2% fee
-                const releaseResult = await escrowClient.releasePayment({
+                const releaseResult = await escrowClient.send.releasePayment({
                     args: {
                         taskId,
                         treasury: adminAddress

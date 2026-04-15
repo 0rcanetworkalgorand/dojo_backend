@@ -82,11 +82,16 @@ export class IndexerListener {
                         console.error(`[Indexer] Failed to update cursor in DB at round ${this.lastBlock}:`, dbErr.message);
                     }
                 }
-            } catch (err) {
-                console.error('[Indexer] Polling error:', err);
+            } catch (err: any) {
+                if (err.message?.includes('fetch failed')) {
+                    console.error('[Indexer] Node connectivity lost. Retrying in 5s...');
+                    await new Promise(r => setTimeout(r, 3000)); // Extra wait on fail
+                } else {
+                    console.error('[Indexer] Polling error:', err);
+                }
             }
-            // Wait 2 seconds before next poll (Algorand block time is ~2.8s-3.3s)
-            await new Promise(r => setTimeout(r, 2000));
+            // Wait 3 seconds before next poll (Algorand block time is ~2.8s-3.3s)
+            await new Promise(r => setTimeout(r, 3000));
         }
     }
 
@@ -266,7 +271,7 @@ export class IndexerListener {
 
     private async syncExistingAgents() {
         try {
-            const registryAppId = BigInt(this.registryAppId);
+            const registryAppId = Number(this.registryAppId);
             const boxesResponse = await algorand.client.algod.getApplicationBoxes(registryAppId).do();
             
             for (const boxInfo of boxesResponse.boxes) {
