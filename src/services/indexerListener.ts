@@ -136,7 +136,7 @@ export class IndexerListener {
         try {
             const abiMethod = new algosdk.ABIMethod(method);
             // Ensure args are Uint8Arrays for decodeMethodArgs
-            const args = (abiMethod as any).decodeMethodArgs(apaa.slice(1).map((a: any) => new Uint8Array(a)));
+            const args = abiMethod.decodeArgs(apaa.slice(1).map((a: any) => new Uint8Array(a)));
 
             if (method.name === 'register_agent') {
                 const [agentId, sensei, lane, configHash] = args;
@@ -190,7 +190,7 @@ export class IndexerListener {
 
         try {
             const abiMethod = new algosdk.ABIMethod(method);
-            const args = (abiMethod as any).decodeMethodArgs(apaa.slice(1).map((a: any) => new Uint8Array(a)));
+            const args = abiMethod.decodeArgs(apaa.slice(1).map((a: any) => new Uint8Array(a)));
 
             if (method.name === 'lock_bounty') {
                 const [taskId, client, worker, bounty, collateral, deadline] = args;
@@ -198,23 +198,29 @@ export class IndexerListener {
                 
                 console.log(`[Indexer] Processing Task Lock: ${taskIdStr}...`);
 
+                let agentId = null;
+                const agent = await prisma.agent.findFirst({ where: { address: worker.toString() } });
+                if (agent) agentId = agent.id;
+
                 const task = await prisma.task.upsert({
                     where: { id: taskIdStr },
                     update: {
                         state: TaskState.LOCKED,
-                        bountyUsdc: BigInt(bounty.toString()),
-                        collateralUsdc: BigInt(collateral.toString()),
-                        clientAddress: client.toString(),
                         workerAddress: worker.toString(),
+                        agentId: agentId || undefined,
+                        bountyUsdc: BigInt(bounty.toString()),
                         deadline: new Date(Number(deadline) * 1000)
                     },
                     create: {
                         id: taskIdStr,
                         state: TaskState.LOCKED,
+                        workerAddress: worker.toString(),
+                        agentId: agentId || undefined,
+                        title: `Task for Agent ${worker.toString().substring(0, 6)}`,
+                        description: 'Locked from on-chain event.',
                         bountyUsdc: BigInt(bounty.toString()),
                         collateralUsdc: BigInt(collateral.toString()),
                         clientAddress: client.toString(),
-                        workerAddress: worker.toString(),
                         lane: LaneType.RESEARCH, // Default
                         deadline: new Date(Number(deadline) * 1000)
                     }

@@ -23,7 +23,8 @@ router.get('/', async (req, res) => {
         });
 
         const mapped = agents.map(a => {
-            const successRate = 100; // Default until failure tracking is active
+            // [DEMO LOGIC] Success rate starts at 100% and drops by 20% for each failed task
+            const successRate = Math.max(0, 100 - (Number(a.tasksFailed) * 20));
             
             // Keep in microAlgos (base units) so frontend formatters work correctly
             const totalEarned = Number(a.totalEarnedUsdc); 
@@ -31,8 +32,8 @@ router.get('/', async (req, res) => {
             return {
                 ...a,
                 address: a.address,
-                name: (a as any).name || `Agent ${a.address.substring(0, 6)}`,
-                taskCount: Number(a.tasksCompleted),
+                name: (a as any).name || (a.id.includes('data-9') ? 'agent data-9' : `Agent ${a.address.substring(0, 6)}`),
+                taskCount: Number(a.tasksCompleted) + Number(a.tasksFailed),
                 successRate,
                 totalEarned,
                 commitmentExpiry: a.listingExpiry ? new Date(a.listingExpiry).getTime() : Date.now() + 30 * 24 * 60 * 60 * 1000,

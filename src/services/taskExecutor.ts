@@ -92,10 +92,11 @@ export class TaskExecutor {
      */
     static async executeTask(taskId: string) {
         console.log(`[TaskExecutor] Starting execution for task ${taskId}`);
+        let task: any = null;
 
         try {
             // 1. Fetch the task from DB
-            const task = await prisma.task.findUnique({
+            task = await prisma.task.findUnique({
                 where: { id: taskId },
                 include: { agent: true }
             });
@@ -120,6 +121,11 @@ export class TaskExecutor {
 
             // 3. Get AI Client and parameters
             const { client, params } = await this.getClientForAgent(task.agentId);
+
+            // [DEMO OVERRIDE] Force fail agent data-9
+            if (task.agentId === 'agent data-9') {
+                throw new Error("DEMO_FAILURE: Internal Cognitive Mismatch triggered for 'agent data-9'");
+            }
 
             const systemPrompt = LANE_PROMPTS[task.lane] || LANE_PROMPTS.RESEARCH;
             const userPrompt = task.description || task.title || 'No description provided';
@@ -218,12 +224,37 @@ export class TaskExecutor {
         } catch (error: any) {
             console.error(`[TaskExecutor] ❌ Failed for task ${taskId}:`, error.message || error);
 
+            // [GLOBAL FAILURE TRACKING] Increment failed tasks for the agent
+            if (task && task.agentId) {
+                console.log(`[TaskExecutor] Logging failure for Agent: ${task.agentId}`);
+                try {
+                    // [DEMO OVERRIDE] for agent data-9: increment both to match user's demo logic
+                    if (task.agentId === 'agent data-9') {
+                        await prisma.agent.update({
+                            where: { id: task.agentId },
+                            data: {
+                                tasksCompleted: { increment: 1 },
+                                tasksFailed: { increment: 1 }
+                            }
+                        });
+                    } else {
+                        // Regular agents just get a failure increment
+                        await prisma.agent.update({
+                            where: { id: task.agentId },
+                            data: { tasksFailed: { increment: 1 } }
+                        });
+                    }
+                } catch (dbErr) {
+                    console.error('[TaskExecutor] Failed to update agent failure stats:', dbErr);
+                }
+            }
+
             try {
                 await prisma.task.update({
                     where: { id: taskId },
                     data: {
                         state: TaskState.SLASHED,
-                        result: `Error: ${error.message || 'Unknown error during execution'}`
+                        result: `Task Failed: ${error.message || 'Unknown Error'}`
                     }
                 });
                 broadcast('TASK_STATUS', {
