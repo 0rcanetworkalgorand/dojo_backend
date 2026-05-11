@@ -3,7 +3,8 @@ import { prisma } from '../lib/prisma';
 import { TaskState } from '../lib/types';
 import { broadcast } from '../lib/socket';
 import { ConfigVault } from './configVault';
-import { escrowClient, adminAddress, algorand } from '../algorand/contracts';
+import { escrowClient, commitmentClient, adminAddress, algorand } from '../algorand/contracts';
+import { microAlgos } from '@algorandfoundation/algokit-utils';
 import fs from 'fs';
 import path from 'path';
 
@@ -156,26 +157,33 @@ export class TaskExecutor {
             });
             broadcast('TASK_STATUS', { taskId, state: TaskState.SUBMITTED, timestamp: new Date() });
 
-            // 6. Auto-settle: mark as SETTLED and credit the Sensei
+            // 6. On-chain settlement: release 98% bounty to sensei, 2% to platform treasury
             const senseiAddress = task.agent?.senseiAddress;
+            const treasuryAddress = process.env.TREASURY_ADDRESS || adminAddress;
             
             console.log(`[TaskExecutor] Initiating on-chain settlement for ${taskId}...`);
+            console.log(`[TaskExecutor] Sensei: ${senseiAddress}, Treasury: ${treasuryAddress}`);
             try {
-                // Call regular EscrowVault contract to release payment
-                // Using adminAddress as treasury for the 2% fee
                 const releaseResult = await escrowClient.send.releasePayment({
                     args: {
                         taskId,
-                        treasury: adminAddress
+                        treasury: treasuryAddress
                     },
                     boxReferences: [
                         { appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }
-                    ]
+                    ],
+                    // The contract's inner txns send ALGO to treasury + sensei — both must be in foreign accounts
+                    accountReferences: [treasuryAddress, senseiAddress].filter(Boolean) as string[],
+                    // release_payment does 2 inner Payment txns, each needs 0.001 ALGO fee
+                    extraFee: microAlgos(2000),
                 });
-                console.log(`[TaskExecutor] On-chain settlement successful for ${taskId}. TxId: ${releaseResult.transaction.txID()}`);
+                console.log(`[TaskExecutor] ✅ On-chain settlement successful for ${taskId}. TxId: ${releaseResult.transaction.txID()}`);
+                console.log(`[TaskExecutor]    → 2% platform fee sent to treasury (${treasuryAddress})`);
+                console.log(`[TaskExecutor]    → 98% bounty sent to sensei (${senseiAddress})`);
             } catch (onChainErr: any) {
-                console.error(`[TaskExecutor] WARNING: On-chain settlement failed for ${taskId}:`, onChainErr.message || onChainErr);
-                // We still update DB so the UI shows progress, but we log the failure
+                console.error(`[TaskExecutor] ❌ CRITICAL: On-chain settlement failed for ${taskId}:`, onChainErr.message || onChainErr);
+                console.error(`[TaskExecutor]    Full error:`, JSON.stringify(onChainErr, null, 2));
+                // Still continue to update DB state, but log prominently
             }
 
             await prisma.task.update({
@@ -223,6 +231,65 @@ export class TaskExecutor {
 
         } catch (error: any) {
             console.error(`[TaskExecutor] ❌ Failed for task ${taskId}:`, error.message || error);
+
+            // ═══════════════════════════════════════════════════════════════
+            // ON-CHAIN SLASH: Refund user's bounty + take 10% from developer
+            // ═══════════════════════════════════════════════════════════════
+            if (task) {
+                // 1. Slash the EscrowVault — return 100% of user's bounty to their wallet
+                console.log(`[TaskExecutor] Initiating on-chain slash for task ${taskId}...`);
+                try {
+                    const slashResult = await escrowClient.send.slashBounty({
+                        args: { taskId },
+                        boxReferences: [
+                            { appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }
+                        ],
+                        accountReferences: [task.clientAddress].filter(Boolean),
+                        extraFee: microAlgos(1000),
+                    });
+                    console.log(`[TaskExecutor] ✅ EscrowVault slash successful — user bounty refunded. TxId: ${slashResult.transaction.txID()}`);
+                    
+                    // Notify frontend about the bounty refund
+                    broadcast('BOUNTY_REFUNDED', {
+                        taskId,
+                        clientAddress: task.clientAddress,
+                        bountyAmount: task.bountyUsdc.toString(),
+                        txId: slashResult.transaction.txID(),
+                        timestamp: new Date()
+                    });
+                } catch (slashErr: any) {
+                    console.error(`[TaskExecutor] WARNING: EscrowVault slash failed for ${taskId}:`, slashErr.message || slashErr);
+                }
+
+                // 2. Slash the CommitmentLock — take 10% from developer's stake to treasury
+                if (task.agentId) {
+                    try {
+                        const treasuryAddr = process.env.TREASURY_ADDRESS || adminAddress;
+                        const commitSlashResult = await commitmentClient.send.slashStake({
+                            args: { stakeId: task.agentId },
+                            boxReferences: [
+                                { appId: BigInt(process.env.COMMITMENT_LOCK_APP_ID || '0'), name: new Uint8Array(Buffer.from(task.agentId)) }
+                            ],
+                            accountReferences: [treasuryAddr],
+                            extraFee: microAlgos(1000),
+                        });
+                        console.log(`[TaskExecutor] ✅ CommitmentLock slash successful — 10% of developer stake sent to treasury. TxId: ${commitSlashResult.transaction.txID()}`);
+                        
+                        // Notify frontend about the collateral slash
+                        broadcast('COLLATERAL_SLASHED', {
+                            taskId,
+                            agentId: task.agentId,
+                            senseiAddress: task.agent?.senseiAddress,
+                            treasuryAddress: treasuryAddr,
+                            slashPercentage: 10,
+                            txId: commitSlashResult.transaction.txID(),
+                            timestamp: new Date()
+                        });
+                    } catch (commitSlashErr: any) {
+                        console.error(`[TaskExecutor] WARNING: CommitmentLock slash failed for agent ${task.agentId}:`, commitSlashErr.message || commitSlashErr);
+                    }
+                }
+            }
 
             // [GLOBAL FAILURE TRACKING] Increment failed tasks for the agent
             if (task && task.agentId) {

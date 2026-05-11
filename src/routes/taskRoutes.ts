@@ -77,15 +77,25 @@ router.post('/match', async (req, res) => {
             }
         }
 
-        const allAgents = [...agents, ...secondaryAgents].map(a => ({
-            ...a,
-            name: (a as any).name || `Agent ${a.address.substring(0, 8)}`,
-            taskCount: Number(a.tasksCompleted),
-            successRate: 100,
-            totalEarned: Number(a.totalEarnedUsdc) / 1_000_000,
-            commitmentExpiry: a.listingExpiry ? new Date(a.listingExpiry).getTime() : Date.now() + 30 * 24 * 60 * 60 * 1000,
-            isPrimaryMatch: agents.some(pa => pa.id === a.id),
-        }));
+        const allAgents = [...agents, ...secondaryAgents].map(a => {
+            const lanePrefix = a.id.split('-')[0] || 'agent';
+            const idSuffix = a.id.split('-').slice(1).join('-') || a.id;
+            const displayName = `Agent ${lanePrefix.charAt(0).toUpperCase() + lanePrefix.slice(1)}-${idSuffix.toUpperCase()}`;
+            const successRate = Math.max(0, 100 - (Number(a.tasksFailed) * 20));
+            return {
+                id: a.id,
+                address: a.address,
+                senseiAddress: a.senseiAddress,
+                lane: a.lane.toLowerCase(),
+                status: a.status,
+                name: displayName,
+                taskCount: Number(a.tasksCompleted) + Number(a.tasksFailed),
+                successRate,
+                totalEarned: Number(a.totalEarnedUsdc),
+                commitmentExpiry: a.listingExpiry ? new Date(a.listingExpiry).getTime() : Date.now() + 30 * 24 * 60 * 60 * 1000,
+                isPrimaryMatch: agents.some(pa => pa.id === a.id),
+            };
+        });
 
         res.json({
             detectedLane: detection.lane,
@@ -101,7 +111,7 @@ router.post('/match', async (req, res) => {
 
 // Client: Post a new task requirement (called from /hire page)
 router.post('/', async (req, res) => {
-    const { title, description, lane, bountyUsdc, clientAddress, deadlineDays, stakeTxId, agentAddress, agentId: reqAgentId } = req.body;
+    const { title, description, lane, bountyUsdc, clientAddress, deadlineDays, stakeTxId, agentAddress, agentId: reqAgentId, id: requestedId } = req.body;
 
     try {
         const deadline = new Date();
@@ -114,9 +124,12 @@ router.post('/', async (req, res) => {
             agentId = agent?.id || null;
         }
 
+        // Use the on-chain taskId from frontend if provided, so the DB ID matches the EscrowVault box key
+        const taskId = requestedId || crypto.randomUUID();
+
         const task = await prisma.task.create({
             data: {
-                id: crypto.randomUUID(),
+                id: taskId,
                 title: title || null,
                 description: description || null,
                 lane: (lane as LaneType) || 'RESEARCH',

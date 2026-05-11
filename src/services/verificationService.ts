@@ -1,5 +1,6 @@
 import { EscrowVaultClient } from '../algorand/EscrowVaultClient';
 import { escrowClient, registryClient, adminAddress } from '../algorand/contracts';
+import { microAlgos } from '@algorandfoundation/algokit-utils';
 import { TaskState } from '../lib/types';
 import { prisma } from '../lib/prisma';
 
@@ -38,7 +39,12 @@ export class VerificationService {
         // Perform on-chain settlement with platform fee (2% handled in contract)
         // We pass treasury to the updated releasePayment method
         await escrowClient.send.releasePayment({ 
-          args: { taskId, treasury } 
+          args: { taskId, treasury },
+          boxReferences: [
+            { appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }
+          ],
+          accountReferences: [treasury, task.agent?.senseiAddress].filter(Boolean) as string[],
+          extraFee: microAlgos(2000),
         });
 
         // Increment successful tasks in Registry
@@ -83,8 +89,8 @@ export class VerificationService {
       console.warn(`[VerificationService] Kite validation failed for task ${taskId}. Triggering slashWorker. Reason: ${kiteResult.error ?? 'invalid hash'}`);
       try {
         // Perform on-chain slashing
-        await escrowClient.send.slashCollateral({ 
-          args: { taskId, treasury } 
+        await escrowClient.send.slashBounty({ 
+          args: { taskId } 
         });
 
         // Increment failed tasks in Registry

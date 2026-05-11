@@ -7,6 +7,7 @@ const express_1 = require("express");
 const prisma_1 = require("../lib/prisma");
 const types_1 = require("../lib/types");
 const contracts_1 = require("../algorand/contracts");
+const algosdk_1 = __importDefault(require("algosdk"));
 const algokit_utils_1 = require("@algorandfoundation/algokit-utils");
 const crypto_1 = __importDefault(require("crypto"));
 const fs_1 = __importDefault(require("fs"));
@@ -19,19 +20,21 @@ router.get('/', async (req, res) => {
     if (lane)
         where.lane = lane.toUpperCase();
     if (sensei)
-        where.senseiAddress = sensei;
+        where.senseiAddress = sensei.toUpperCase();
     try {
         let agents = await prisma_1.prisma.agent.findMany({
             where,
         });
         const mapped = agents.map(a => {
-            const successRate = 100; // Default until failure tracking is active
-            const totalEarned = Number(a.totalEarnedUsdc) / 1_000_000;
+            // [DEMO LOGIC] Success rate starts at 100% and drops by 20% for each failed task
+            const successRate = Math.max(0, 100 - (Number(a.tasksFailed) * 20));
+            // Keep in microAlgos (base units) so frontend formatters work correctly
+            const totalEarned = Number(a.totalEarnedUsdc);
             return {
                 ...a,
                 address: a.address,
-                name: a.name || `Agent ${a.address.substring(0, 6)}`,
-                taskCount: Number(a.tasksCompleted),
+                name: a.name || (a.id.includes('data-9') ? 'agent data-9' : `Agent ${a.address.substring(0, 6)}`),
+                taskCount: Number(a.tasksCompleted) + Number(a.tasksFailed),
                 successRate,
                 totalEarned,
                 commitmentExpiry: a.listingExpiry ? new Date(a.listingExpiry).getTime() : Date.now() + 30 * 24 * 60 * 60 * 1000,
@@ -72,12 +75,14 @@ router.post('/register', async (req, res) => {
         if (!vaultKeyHex || vaultKeyHex.length !== 64) {
             throw new Error('Backend VAULT_KEY is not configured correctly (must be 64 hex chars)');
         }
+        const wallet = algosdk_1.default.generateAccount();
         const configToEncrypt = {
             lane,
             llmTier,
             biddingStrategy,
             openai_api_key: openaiApiKey,
-            agent_address: agentId // agentId is used as the address/unique identifier
+            private_key: Buffer.from(wallet.sk).toString('base64'),
+            agent_address: wallet.addr
         };
         const vaultKey = Buffer.from(vaultKeyHex, 'hex');
         const salt = Buffer.from('0rca_swarm_dojo_salt');
@@ -98,19 +103,51 @@ router.post('/register', async (req, res) => {
         }
         const vaultPath = path_1.default.join(vaultDir, `${agentId}.enc`);
         fs_1.default.writeFileSync(vaultPath, encryptedBlob);
-        console.log(`[ProxyRegister] Step 2: Vault file written: ${vaultPath}`);
         // 2. Map lane string to required UInt64 for contract
-        const laneInt = lane === 'RESEARCH' ? 0 : lane === 'OUTREACH' ? 1 : 2;
-        const laneBigInt = BigInt(laneInt);
+        // Lane enum: 0=RESEARCH, 1=CODE, 2=DATA, 3=OUTREACH
+        const laneMap = {
+            'RESEARCH': 0,
+            'CODE': 1,
+            'DATA': 2,
+            'OUTREACH': 3
+        };
+        const laneInt = laneMap[lane] ?? 0;
+        const laneBigInt = BigInt(laneInt); // UInt64 for contract
         // 3. Mock config hash for the contract (the actual config is in the vault)
         const configHash = crypto_1.default.createHash('sha256').update(encryptedBlob).digest();
-        console.log(`[ProxyRegister] Step 2: lane=${laneBigInt}, sensei=${senseiAddress}`);
-        // 3. Attempt on-chain registration
+        // Save agent to DB immediately with the real address so frontend gets a valid Algorand address
+        await prisma_1.prisma.agent.upsert({
+            where: { id: agentId },
+            update: {
+                address: wallet.addr,
+                senseiAddress: senseiAddress,
+            },
+            create: {
+                id: agentId,
+                address: wallet.addr,
+                senseiAddress: senseiAddress,
+                lane: lane,
+                status: 'INACTIVE',
+                configHash: configHash.toString('hex')
+            }
+        });
+        console.log(`[ProxyRegister] Step 2: lane=${laneInt}, sensei=${senseiAddress}`);
+        // 3. Attempt on-chain registration and fund contract with 200k microAlgos for MBR
         let txId = 'already-on-chain';
         try {
             const suggestedParams = await contracts_1.registryClient.algorand.client.algod.getTransactionParams().do();
             const baseFee = BigInt(suggestedParams.fee || 1000);
-            const result = await contracts_1.registryClient.newGroup().registerAgent({
+            // Mitigate algokit-utils bug expecting `transaction.from.publicKey` on v2 Transaction objects
+            // by explicitly passing the signer into a 0-ALGO dummy transaction in the group.
+            const dummyTxn = algosdk_1.default.makePaymentTxnWithSuggestedParamsFromObject({
+                from: contracts_1.adminAddress,
+                to: contracts_1.adminAddress,
+                amount: 0,
+                suggestedParams
+            });
+            const result = await contracts_1.registryClient.newGroup()
+                .addTransaction(dummyTxn, contracts_1.signer)
+                .registerAgent({
                 args: {
                     agentId,
                     sensei: senseiAddress,
@@ -121,11 +158,12 @@ router.post('/register', async (req, res) => {
                     new Uint8Array(Buffer.from(agentId))
                 ],
                 staticFee: (0, algokit_utils_1.microAlgos)(baseFee)
-            }).send();
+            }).send({ maxRoundsToWaitForConfirmation: 10 });
             txId = result.txIds[0];
             console.log(`[ProxyRegister] Step 3: On-chain txn successful. Tx: ${txId}`);
         }
         catch (chainErr) {
+            console.error('Registration failed with error:', chainErr.stack || chainErr);
             const errMsg = chainErr?.message || '';
             // pc=178 is "Agent already registered" in the contract
             if (errMsg.includes('pc=178') || errMsg.includes('Agent already registered')) {
@@ -173,7 +211,8 @@ router.post('/register', async (req, res) => {
 });
 // Get user/agent stats
 router.get('/stats/:address', async (req, res) => {
-    const { address } = req.params;
+    const { address: rawAddress } = req.params;
+    const address = rawAddress.toUpperCase(); // Normalize for case-sensitive lookups
     try {
         let agents = await prisma_1.prisma.agent.findMany({
             where: { senseiAddress: address }
@@ -192,6 +231,7 @@ router.get('/stats/:address', async (req, res) => {
             tasksToday: tasks.filter(t => t.createdAt > new Date(Date.now() - 86400000)).length,
             usdcVolume: agents.reduce((sum, a) => sum + Number(a.totalEarnedUsdc), 0),
         };
+        console.log(`[Stats API] Returning stats for ${address}:`, stats);
         res.json(stats);
     }
     catch (err) {

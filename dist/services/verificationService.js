@@ -77,8 +77,8 @@ class VerificationService {
             console.warn(`[VerificationService] Kite validation failed for task ${taskId}. Triggering slashWorker. Reason: ${kiteResult.error ?? 'invalid hash'}`);
             try {
                 // Perform on-chain slashing
-                await contracts_1.escrowClient.send.slashCollateral({
-                    args: { taskId, treasury }
+                await contracts_1.escrowClient.send.slashBounty({
+                    args: { taskId }
                 });
                 // Increment failed tasks in Registry
                 if (task.agent?.address) {

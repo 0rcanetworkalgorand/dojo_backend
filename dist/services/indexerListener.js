@@ -83,10 +83,16 @@ class IndexerListener {
                 }
             }
             catch (err) {
-                console.error('[Indexer] Polling error:', err);
+                if (err.message?.includes('fetch failed')) {
+                    console.error('[Indexer] Node connectivity lost. Retrying in 5s...');
+                    await new Promise(r => setTimeout(r, 3000)); // Extra wait on fail
+                }
+                else {
+                    console.error('[Indexer] Polling error:', err);
+                }
             }
-            // Wait 2 seconds before next poll (Algorand block time is ~2.8s-3.3s)
-            await new Promise(r => setTimeout(r, 2000));
+            // Wait 3 seconds before next poll (Algorand block time is ~2.8s-3.3s)
+            await new Promise(r => setTimeout(r, 3000));
         }
     }
     async processBlock(round) {
@@ -130,7 +136,7 @@ class IndexerListener {
         try {
             const abiMethod = new algosdk_1.default.ABIMethod(method);
             // Ensure args are Uint8Arrays for decodeMethodArgs
-            const args = abiMethod.decodeMethodArgs(apaa.slice(1).map((a) => new Uint8Array(a)));
+            const args = abiMethod.decodeArgs(apaa.slice(1).map((a) => new Uint8Array(a)));
             if (method.name === 'register_agent') {
                 const [agentId, sensei, lane, configHash] = args;
                 const agentIdStr = typeof agentId === 'string' ? agentId : Buffer.from(agentId).toString('utf-8');
@@ -145,7 +151,7 @@ class IndexerListener {
                     },
                     create: {
                         id: agentIdStr,
-                        address: agentIdStr,
+                        address: algosdk_1.default.generateAccount().addr,
                         senseiAddress: senseiAddr,
                         lane: this.mapLane(Number(lane)),
                         configHash: Buffer.from(configHash).toString('hex'),
@@ -182,33 +188,38 @@ class IndexerListener {
             return;
         try {
             const abiMethod = new algosdk_1.default.ABIMethod(method);
-            const args = abiMethod.decodeMethodArgs(apaa.slice(1).map((a) => new Uint8Array(a)));
+            const args = abiMethod.decodeArgs(apaa.slice(1).map((a) => new Uint8Array(a)));
             if (method.name === 'lock_bounty') {
-                const [taskId, client, worker, bounty, collateral, deadline] = args;
+                // New ABI: lock_bounty(string, address, address, address, uint64, pay)
+                const [taskId, client, worker, sensei, bounty] = args;
                 const taskIdStr = typeof taskId === 'string' ? taskId : Buffer.from(taskId).toString('utf-8');
                 console.log(`[Indexer] Processing Task Lock: ${taskIdStr}...`);
+                let agentId = null;
+                const agent = await prisma_1.prisma.agent.findFirst({ where: { address: worker.toString() } });
+                if (agent)
+                    agentId = agent.id;
                 const task = await prisma_1.prisma.task.upsert({
                     where: { id: taskIdStr },
                     update: {
                         state: types_1.TaskState.LOCKED,
-                        bountyUsdc: BigInt(bounty.toString()),
-                        collateralUsdc: BigInt(collateral.toString()),
-                        clientAddress: client.toString(),
                         workerAddress: worker.toString(),
-                        deadline: new Date(Number(deadline) * 1000)
+                        agentId: agentId || undefined,
+                        bountyUsdc: BigInt(bounty.toString()),
                     },
                     create: {
                         id: taskIdStr,
                         state: types_1.TaskState.LOCKED,
-                        bountyUsdc: BigInt(bounty.toString()),
-                        collateralUsdc: BigInt(collateral.toString()),
-                        clientAddress: client.toString(),
                         workerAddress: worker.toString(),
+                        agentId: agentId || undefined,
+                        title: `Task for Agent ${worker.toString().substring(0, 6)}`,
+                        description: 'Locked from on-chain event.',
+                        bountyUsdc: BigInt(bounty.toString()),
+                        clientAddress: client.toString(),
                         lane: types_1.LaneType.RESEARCH, // Default
-                        deadline: new Date(Number(deadline) * 1000)
+                        deadline: new Date(Date.now() + 7 * 86400 * 1000), // Default 7 day deadline
                     }
                 });
-                console.log(`[Indexer] ✅ Task Locked: ${taskIdStr} (Worker: ${worker.toString()})`);
+                console.log(`[Indexer] ✅ Task Locked: ${taskIdStr} (Worker: ${worker.toString()}, Sensei: ${sensei.toString()})`);
                 this.broadcastEvent('TASK_LOCKED', task);
                 // Trigger Agent Execution!
                 if (task.agentId && task.workerAddress) {
@@ -223,12 +234,38 @@ class IndexerListener {
             else if (method.name === 'release_payment') {
                 const [taskId] = args;
                 const taskIdStr = typeof taskId === 'string' ? taskId : Buffer.from(taskId).toString('utf-8');
-                const task = await prisma_1.prisma.task.update({
+                // 1. Fetch task to get agent attribution
+                const task = await prisma_1.prisma.task.findUnique({
                     where: { id: taskIdStr },
-                    data: { state: types_1.TaskState.SETTLED, settledAt: new Date() }
+                    include: { agent: true }
                 });
-                console.log(`[Indexer] ✅ Payment Released for Task: ${taskIdStr}`);
-                this.broadcastEvent('TASK_SETTLED', task);
+                if (task && task.state !== types_1.TaskState.SETTLED) {
+                    console.log(`[Indexer] Processing Payment Release for Task: ${taskIdStr} (2% treasury, 98% sensei)...`);
+                    // 2. Update Task state
+                    await prisma_1.prisma.task.update({
+                        where: { id: taskIdStr },
+                        data: { state: types_1.TaskState.SETTLED, settledAt: new Date() }
+                    });
+                    console.log(`[Indexer] ✅ Payment Released for Task: ${taskIdStr}`);
+                    this.broadcastEvent('TASK_SETTLED', { ...task, state: types_1.TaskState.SETTLED });
+                }
+            }
+            else if (method.name === 'slash_bounty') {
+                const [taskId] = args;
+                const taskIdStr = typeof taskId === 'string' ? taskId : Buffer.from(taskId).toString('utf-8');
+                const task = await prisma_1.prisma.task.findUnique({
+                    where: { id: taskIdStr },
+                    include: { agent: true }
+                });
+                if (task && task.state !== types_1.TaskState.SLASHED) {
+                    console.log(`[Indexer] Processing Bounty Slash for Task: ${taskIdStr} (100% refunded to user)...`);
+                    await prisma_1.prisma.task.update({
+                        where: { id: taskIdStr },
+                        data: { state: types_1.TaskState.SLASHED }
+                    });
+                    console.log(`[Indexer] ✅ Bounty Slashed for Task: ${taskIdStr}`);
+                    this.broadcastEvent('TASK_SLASHED', { ...task, state: types_1.TaskState.SLASHED });
+                }
             }
         }
         catch (e) {
@@ -245,7 +282,7 @@ class IndexerListener {
     }
     async syncExistingAgents() {
         try {
-            const registryAppId = BigInt(this.registryAppId);
+            const registryAppId = Number(this.registryAppId);
             const boxesResponse = await contracts_1.algorand.client.algod.getApplicationBoxes(registryAppId).do();
             for (const boxInfo of boxesResponse.boxes) {
                 try {
@@ -262,7 +299,7 @@ class IndexerListener {
                             where: { id: agentId },
                             update: {
                                 address: agentId, // agentId is the unique identifier
-                                status: statusRaw === 1 ? types_1.AgentStatus.ACTIVE : types_1.AgentStatus.INACTIVE,
+                                status: (statusRaw === 0 || statusRaw === 1) ? types_1.AgentStatus.ACTIVE : types_1.AgentStatus.INACTIVE,
                                 lane: this.mapLane(laneRaw),
                                 configHash,
                                 tasksCompleted: BigInt(tasksCompleted),
@@ -272,7 +309,7 @@ class IndexerListener {
                                 id: agentId,
                                 address: agentId,
                                 senseiAddress: senseiAddr,
-                                status: statusRaw === 1 ? types_1.AgentStatus.ACTIVE : types_1.AgentStatus.INACTIVE,
+                                status: (statusRaw === 0 || statusRaw === 1) ? types_1.AgentStatus.ACTIVE : types_1.AgentStatus.INACTIVE,
                                 lane: this.mapLane(laneRaw),
                                 configHash,
                                 tasksCompleted: BigInt(tasksCompleted),
@@ -282,8 +319,8 @@ class IndexerListener {
                         (0, socket_1.broadcast)('AGENT_REGISTERED', {
                             address: senseiAddr,
                             agentId: agentId,
-                            lane: laneRaw,
-                            status: statusRaw,
+                            lane: this.mapLane(laneRaw),
+                            status: (statusRaw === 0 || statusRaw === 1) ? types_1.AgentStatus.ACTIVE : types_1.AgentStatus.INACTIVE,
                             configHash
                         });
                     }

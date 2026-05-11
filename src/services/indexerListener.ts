@@ -136,7 +136,7 @@ export class IndexerListener {
         try {
             const abiMethod = new algosdk.ABIMethod(method);
             // Ensure args are Uint8Arrays for decodeMethodArgs
-            const args = abiMethod.decodeArgs(apaa.slice(1).map((a: any) => new Uint8Array(a)));
+            const args = (abiMethod as any).decodeArgs(apaa.slice(1).map((a: any) => new Uint8Array(a)));
 
             if (method.name === 'register_agent') {
                 const [agentId, sensei, lane, configHash] = args;
@@ -154,7 +154,7 @@ export class IndexerListener {
                     },
                     create: {
                         id: agentIdStr,
-                        address: agentIdStr,
+                        address: algosdk.generateAccount().addr,
                         senseiAddress: senseiAddr,
                         lane: this.mapLane(Number(lane)),
                         configHash: Buffer.from(configHash as Uint8Array).toString('hex'),
@@ -190,15 +190,16 @@ export class IndexerListener {
 
         try {
             const abiMethod = new algosdk.ABIMethod(method);
-            const args = abiMethod.decodeArgs(apaa.slice(1).map((a: any) => new Uint8Array(a)));
+            const args = (abiMethod as any).decodeArgs(apaa.slice(1).map((a: any) => new Uint8Array(a)));
 
             if (method.name === 'lock_bounty') {
-                const [taskId, client, worker, bounty, collateral, deadline] = args;
+                // New ABI: lock_bounty(string, address, address, address, uint64, pay)
+                const [taskId, client, worker, sensei, bounty] = args;
                 const taskIdStr = typeof taskId === 'string' ? taskId : Buffer.from(taskId as Uint8Array).toString('utf-8');
                 
                 console.log(`[Indexer] Processing Task Lock: ${taskIdStr}...`);
 
-                let agentId = null;
+                let agentId: string | null = null;
                 const agent = await prisma.agent.findFirst({ where: { address: worker.toString() } });
                 if (agent) agentId = agent.id;
 
@@ -209,7 +210,6 @@ export class IndexerListener {
                         workerAddress: worker.toString(),
                         agentId: agentId || undefined,
                         bountyUsdc: BigInt(bounty.toString()),
-                        deadline: new Date(Number(deadline) * 1000)
                     },
                     create: {
                         id: taskIdStr,
@@ -219,13 +219,12 @@ export class IndexerListener {
                         title: `Task for Agent ${worker.toString().substring(0, 6)}`,
                         description: 'Locked from on-chain event.',
                         bountyUsdc: BigInt(bounty.toString()),
-                        collateralUsdc: BigInt(collateral.toString()),
                         clientAddress: client.toString(),
                         lane: LaneType.RESEARCH, // Default
-                        deadline: new Date(Number(deadline) * 1000)
+                        deadline: new Date(Date.now() + 7 * 86400 * 1000), // Default 7 day deadline
                     }
                 });
-                console.log(`[Indexer] ✅ Task Locked: ${taskIdStr} (Worker: ${worker.toString()})`);
+                console.log(`[Indexer] ✅ Task Locked: ${taskIdStr} (Worker: ${worker.toString()}, Sensei: ${sensei.toString()})`);
                 this.broadcastEvent('TASK_LOCKED', task);
 
                 // Trigger Agent Execution!
@@ -248,7 +247,7 @@ export class IndexerListener {
                 });
 
                 if (task && task.state !== TaskState.SETTLED) {
-                    console.log(`[Indexer] Processing Payment Release for Task: ${taskIdStr}...`);
+                    console.log(`[Indexer] Processing Payment Release for Task: ${taskIdStr} (2% treasury, 98% sensei)...`);
                     
                     // 2. Update Task state
                     await prisma.task.update({
@@ -258,6 +257,26 @@ export class IndexerListener {
 
                     console.log(`[Indexer] ✅ Payment Released for Task: ${taskIdStr}`);
                     this.broadcastEvent('TASK_SETTLED', { ...task, state: TaskState.SETTLED });
+                }
+            } else if (method.name === 'slash_bounty') {
+                const [taskId] = args;
+                const taskIdStr = typeof taskId === 'string' ? taskId : Buffer.from(taskId as Uint8Array).toString('utf-8');
+                
+                const task = await prisma.task.findUnique({
+                    where: { id: taskIdStr },
+                    include: { agent: true }
+                });
+
+                if (task && task.state !== TaskState.SLASHED) {
+                    console.log(`[Indexer] Processing Bounty Slash for Task: ${taskIdStr} (100% refunded to user)...`);
+                    
+                    await prisma.task.update({
+                        where: { id: taskIdStr },
+                        data: { state: TaskState.SLASHED }
+                    });
+
+                    console.log(`[Indexer] ✅ Bounty Slashed for Task: ${taskIdStr}`);
+                    this.broadcastEvent('TASK_SLASHED', { ...task, state: TaskState.SLASHED });
                 }
             }
         } catch (e: any) {

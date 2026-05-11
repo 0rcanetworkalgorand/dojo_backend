@@ -32,13 +32,10 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ExecutionManager = void 0;
 const child_process_1 = require("child_process");
-const path_1 = __importDefault(require("path"));
+const path = __importStar(require("path"));
 const fs = __importStar(require("fs"));
 const verificationService_1 = require("./verificationService");
 class ExecutionManager {
@@ -55,7 +52,7 @@ class ExecutionManager {
         console.log(`[ExecutionManager] Assigning task ${taskId} to agent ${agentId}`);
         let agentProcess = this.activeAgents.get(agentId);
         if (!agentProcess || agentProcess.killed) {
-            const scriptPath = path_1.default.resolve(__dirname, '../../../dojo-agents/main.py');
+            const scriptPath = path.resolve(__dirname, '../../../dojo-agents/main.py');
             // Ensure the script exists
             if (!fs.existsSync(scriptPath)) {
                 console.error(`[ExecutionManager] Agent script not found at ${scriptPath}`);

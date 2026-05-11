@@ -4,8 +4,14 @@ exports.broadcast = exports.initSocket = void 0;
 const socket_io_1 = require("socket.io");
 let io = null;
 const initSocket = (server) => {
-    io = new socket_io_1.Server(server, { cors: { origin: "*" } });
-    console.log('📡 WebSocket Server Initialized');
+    io = new socket_io_1.Server(server, {
+        cors: {
+            origin: "*",
+            methods: ["GET", "POST"]
+        },
+        transports: ['polling', 'websocket']
+    });
+    console.log('📡 WebSocket Server Initialized (Polling + WebSocket supported)');
     return io;
 };
 exports.initSocket = initSocket;
