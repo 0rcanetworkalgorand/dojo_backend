@@ -7,6 +7,48 @@ import { escrowClient, commitmentClient, adminAddress, algorand } from '../algor
 import { microAlgos } from '@algorandfoundation/algokit-utils';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
+
+function encryptHybrid(plainText: string, publicKeyBase64: string): string | null {
+    try {
+        // 1. Generate random AES-256-GCM key
+        const aesKey = crypto.randomBytes(32);
+        const iv = crypto.randomBytes(16);
+        
+        // 2. Encrypt data with AES
+        const cipher = crypto.createCipheriv('aes-256-gcm', aesKey, iv);
+        const encryptedData = Buffer.concat([
+            cipher.update(plainText, 'utf8'),
+            cipher.final()
+        ]);
+        const authTag = cipher.getAuthTag();
+        
+        // 3. Encrypt AES key with RSA public key
+        const publicKey = crypto.createPublicKey({
+            key: Buffer.from(publicKeyBase64, 'base64'),
+            type: 'spki',
+            format: 'der'
+        });
+        
+        const encryptedAesKey = crypto.publicEncrypt(
+            {
+                key: publicKey,
+                padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+                oaepHash: 'sha256'
+            },
+            aesKey
+        );
+        
+        // 4. Combine: IV (16) + AuthTag (16) + EncryptedAESKey + EncryptedData
+        const combined = Buffer.concat([iv, authTag, encryptedAesKey, encryptedData]);
+        return combined.toString('base64');
+        
+    } catch (error) {
+        console.error('[Encryption] Failed to encrypt output:', error);
+        return null;
+        return plainText;
+    }
+}
 
 const LANE_PROMPTS: Record<string, string> = {
     RESEARCH: `You are an elite research analyst for the 0rca Swarm Dojo — a decentralized AI agent marketplace on Algorand. 
@@ -147,87 +189,52 @@ export class TaskExecutor {
             const result = completion.choices[0]?.message?.content || 'No output generated.';
             console.log(`[TaskExecutor] AI response received (${result.length} chars)`);
 
-            // 5. Update state to SUBMITTED with the result
+            // 5. Encrypt result with client's public key before storing
+            let encryptedResult: string | null = null;
+            console.log(`[TaskExecutor] Client public key:`, task.clientPublicKey ? 'EXISTS' : 'MISSING');
+            if (task.clientPublicKey) {
+                const encrypted = encryptHybrid(result, task.clientPublicKey);
+                if (encrypted) {
+                    encryptedResult = encrypted;
+                    console.log(`[TaskExecutor] Output encrypted (hybrid), length:`, encryptedResult.length);
+                } else {
+                    console.error('[TaskExecutor] Encryption failed');
+                }
+            } else {
+                console.warn(`[TaskExecutor] No clientPublicKey found - using plain result`);
+            }
+
+            // 5. Update state to SUBMITTED with the encrypted result
             await prisma.task.update({
                 where: { id: taskId },
                 data: {
                     state: TaskState.SUBMITTED,
-                    result
+                    result: null,
+                    encryptedResult
                 }
             });
             broadcast('TASK_STATUS', { taskId, state: TaskState.SUBMITTED, timestamp: new Date() });
 
-            // 6. On-chain settlement: release 98% bounty to sensei, 2% to platform treasury
-            const senseiAddress = task.agent?.senseiAddress;
-            const treasuryAddress = process.env.TREASURY_ADDRESS || adminAddress;
-            
-            console.log(`[TaskExecutor] Initiating on-chain settlement for ${taskId}...`);
-            console.log(`[TaskExecutor] Sensei: ${senseiAddress}, Treasury: ${treasuryAddress}`);
-            try {
-                const releaseResult = await escrowClient.send.releasePayment({
-                    args: {
-                        taskId,
-                        treasury: treasuryAddress
-                    },
-                    boxReferences: [
-                        { appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }
-                    ],
-                    // The contract's inner txns send ALGO to treasury + sensei — both must be in foreign accounts
-                    accountReferences: [treasuryAddress, senseiAddress].filter(Boolean) as string[],
-                    // release_payment does 2 inner Payment txns, each needs 0.001 ALGO fee
-                    extraFee: microAlgos(2000),
-                });
-                console.log(`[TaskExecutor] ✅ On-chain settlement successful for ${taskId}. TxId: ${releaseResult.transaction.txID()}`);
-                console.log(`[TaskExecutor]    → 2% platform fee sent to treasury (${treasuryAddress})`);
-                console.log(`[TaskExecutor]    → 98% bounty sent to sensei (${senseiAddress})`);
-            } catch (onChainErr: any) {
-                console.error(`[TaskExecutor] ❌ CRITICAL: On-chain settlement failed for ${taskId}:`, onChainErr.message || onChainErr);
-                console.error(`[TaskExecutor]    Full error:`, JSON.stringify(onChainErr, null, 2));
-                // Still continue to update DB state, but log prominently
-            }
+            // 6. WAIT for client approval - do NOT auto-release payment
+            // Payment will be released when user clicks "Satisfied" via /api/tasks/:id/release
+            // Or slashed when user clicks "Not Satisfied" via /api/tasks/:id/slash
+            console.log(`[TaskExecutor] ✅ Task ${taskId} output ready. Waiting for client approval...`);
+            console.log(`[TaskExecutor]    State: SUBMITTED. Payment will be released on approval.`);
 
-            await prisma.task.update({
-                where: { id: taskId },
-                data: {
-                    state: TaskState.SETTLED,
-                    settledAt: new Date()
-                }
-            });
-
-            // 7. INSTANT Real-time Stats Update
-            if (task.agentId) {
-                await prisma.agent.update({
-                    where: { id: task.agentId },
-                    data: {
-                        tasksCompleted: { increment: 1 },
-                        totalEarnedUsdc: { increment: task.bountyUsdc }
-                    }
-                });
-                console.log(`[TaskExecutor] ✅ Instant stats updated for Agent: ${task.agentId} (+${task.bountyUsdc} microAlgos)`);
-            }
-
-            // 8. Broadcast the settlement event for real-time UI refresh
-            broadcast('TASK_SETTLED', { 
-                ...task, 
-                state: TaskState.SETTLED, 
-                settledAt: new Date() 
-            });
-
-            // 9. Broadcast the final result to all connected clients
+            // 7. Broadcast the result - client must approve to release payment
             broadcast('TASK_RESULT', {
                 taskId,
-                state: TaskState.SETTLED,
-                result,
+                state: TaskState.SUBMITTED,
+                encryptedResult,
                 lane: task.lane,
                 agentId: task.agentId,
                 agentName: task.agent?.id || 'Unknown',
                 senseiAddress,
                 bountyUsdc: task.bountyUsdc.toString(),
-                settledAt: new Date(),
                 timestamp: new Date()
             });
 
-            console.log(`[TaskExecutor] ✅ Task ${taskId} finalized and broadcasted.`);
+            console.log(`[TaskExecutor] ✅ Task ${taskId} output generated and broadcasted. Awaiting approval.`);
 
         } catch (error: any) {
             console.error(`[TaskExecutor] ❌ Failed for task ${taskId}:`, error.message || error);
@@ -317,11 +324,18 @@ export class TaskExecutor {
             }
 
             try {
+                // Encrypt error message if client public key exists
+                const errorMessage = `Task Failed: ${error.message || 'Unknown Error'}`;
+                let encryptedError: string | null = null;
+                if (task?.clientPublicKey) {
+                    encryptedError = encryptHybrid(errorMessage, task.clientPublicKey);
+                }
                 await prisma.task.update({
                     where: { id: taskId },
                     data: {
                         state: TaskState.SLASHED,
-                        result: `Task Failed: ${error.message || 'Unknown Error'}`
+                        result: null,
+                        encryptedResult: encryptedError
                     }
                 });
                 broadcast('TASK_STATUS', {

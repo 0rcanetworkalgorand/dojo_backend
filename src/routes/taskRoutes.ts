@@ -4,6 +4,8 @@ import { TaskState, LaneType } from '../lib/types';
 import { broadcast } from '../lib/socket';
 import { AuctionService } from '../services/AuctionService';
 import { TaskExecutor } from '../services/taskExecutor';
+import { escrowClient, commitmentClient, adminAddress } from '../algorand/contracts';
+import { microAlgos } from '@algorandfoundation/algokit-utils';
 
 const router = Router();
 const auctionService = new AuctionService();
@@ -111,7 +113,7 @@ router.post('/match', async (req, res) => {
 
 // Client: Post a new task requirement (called from /hire page)
 router.post('/', async (req, res) => {
-    const { title, description, lane, bountyUsdc, clientAddress, deadlineDays, stakeTxId, agentAddress, agentId: reqAgentId, id: requestedId } = req.body;
+    const { title, description, lane, bountyUsdc, clientAddress, deadlineDays, stakeTxId, agentAddress, agentId: reqAgentId, id: requestedId, clientPublicKey } = req.body;
 
     try {
         const deadline = new Date();
@@ -135,6 +137,7 @@ router.post('/', async (req, res) => {
                 lane: (lane as LaneType) || 'RESEARCH',
                 bountyUsdc: BigInt(bountyUsdc || 0),
                 clientAddress: clientAddress || 'unknown',
+                clientPublicKey: clientPublicKey || null,
                 agentId,
                 workerAddress: agentAddress || null,
                 state: TaskState.CREATED,
@@ -249,6 +252,105 @@ router.delete('/:id', async (req, res) => {
         res.json({ message: 'Task cleaned up' });
     } catch (error) {
         res.status(500).json({ error: 'Failed to cleanup task' });
+    }
+});
+
+// Client approves task - release payment to sensei
+router.post('/:id/release', async (req, res) => {
+    const { id: taskId } = req.params;
+    const { callerAddress } = req.body;
+    
+    try {
+        const task = await prisma.task.findUnique({ 
+            where: { id: taskId },
+            include: { agent: true }
+        });
+        
+        if (!task) return res.status(404).json({ error: 'Task not found' });
+        if (task.state !== TaskState.SUBMITTED) return res.status(400).json({ error: 'Task not in SUBMITTED state' });
+        if (task.clientAddress !== callerAddress) return res.status(403).json({ error: 'Not authorized' });
+        
+        const senseiAddress = task.agent?.senseiAddress;
+        const treasuryAddress = process.env.TREASURY_ADDRESS || adminAddress;
+        
+        console.log(`[TaskRoutes] Releasing payment for task ${taskId}...`);
+        
+        const releaseResult = await escrowClient.send.releasePayment({
+            args: { taskId, treasury: treasuryAddress },
+            boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
+            accountReferences: [treasuryAddress, senseiAddress].filter(Boolean) as string[],
+            extraFee: microAlgos(2000),
+        });
+        
+        await prisma.task.update({
+            where: { id: taskId },
+            data: { state: TaskState.SETTLED, settledAt: new Date() }
+        });
+        
+        if (task.agentId) {
+            await prisma.agent.update({
+                where: { id: task.agentId },
+                data: { tasksCompleted: { increment: 1 }, totalEarnedUsdc: { increment: task.bountyUsdc } }
+            });
+        }
+        
+        res.json({ success: true, txId: releaseResult.transaction.txID() });
+    } catch (error: any) {
+        console.error('[TaskRoutes] Release failed:', error);
+        res.status(500).json({ error: error.message || 'Failed to release payment' });
+    }
+});
+
+// Client rejects task - slash and refund
+router.post('/:id/slash', async (req, res) => {
+    const { id: taskId } = req.params;
+    const { callerAddress } = req.body;
+    
+    try {
+        const task = await prisma.task.findUnique({ 
+            where: { id: taskId },
+            include: { agent: true }
+        });
+        
+        if (!task) return res.status(404).json({ error: 'Task not found' });
+        if (task.state !== TaskState.SUBMITTED) return res.status(400).json({ error: 'Task not in SUBMITTED state' });
+        if (task.clientAddress !== callerAddress) return res.status(403).json({ error: 'Not authorized' });
+        
+        console.log(`[TaskRoutes] Slashing task ${taskId}...`);
+        
+        // Refund client
+        await escrowClient.send.slashBounty({
+            args: { taskId },
+            boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
+            accountReferences: [task.clientAddress].filter(Boolean),
+            extraFee: microAlgos(1000),
+        });
+        
+        // Slash sensei stake
+        if (task.agentId && task.agent?.senseiAddress) {
+            const treasuryAddr = process.env.TREASURY_ADDRESS || adminAddress;
+            await commitmentClient.send.slashStake({
+                args: { stakeId: task.agentId },
+                boxReferences: [{ appId: BigInt(process.env.COMMITMENT_LOCK_APP_ID || '0'), name: new Uint8Array(Buffer.from(task.agentId)) }],
+                accountReferences: [treasuryAddr],
+                extraFee: microAlgos(1000),
+            });
+            
+            await prisma.agent.update({
+                where: { id: task.agentId },
+                data: { tasksFailed: { increment: 1 } }
+            });
+        }
+        
+        await prisma.task.update({
+            where: { id: taskId },
+            data: { state: TaskState.SLASHED }
+        });
+        
+        res.json({ success: true });
+    } catch (error: any) {
+        console.error('[TaskRoutes] Slash failed:', error);
+        res.status(500).json({ error: error.message || 'Failed to slash' });
     }
 });
 

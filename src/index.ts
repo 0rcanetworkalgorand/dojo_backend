@@ -11,6 +11,8 @@ import { IndexerListener } from './services/indexerListener';
 import { startCommitmentWatcher } from './services/commitmentWatcher';
 import agentRoutes from './routes/agentRoutes';
 import taskRoutes from './routes/taskRoutes';
+import { getReiRecommendation } from './services/rei';
+import { initSession, executeSession, approveAndAdvance, rejectAndAdvance, getSessionStatus } from './services/reiSessionManager';
 
 
 // Ensure BigInt values can be serialized to JSON
@@ -29,6 +31,72 @@ app.use(express.json());
 
 app.use('/api/agents', agentRoutes);
 app.use('/api/tasks', taskRoutes);
+
+// ── Rei Routes ──────────────────────────────────────────────────────────
+app.post('/api/rei/analyze', async (req, res) => {
+    const { description } = req.body;
+    if (!description || description.trim().length < 5) {
+        return res.status(400).json({ error: 'Description must be at least 5 characters.' });
+    }
+    try {
+        const recommendation = await getReiRecommendation(description);
+        res.json(recommendation);
+    } catch (error: any) {
+        console.error('[Rei] /api/rei/analyze error:', error);
+        res.status(500).json({ error: 'Rei analysis failed.' });
+    }
+});
+
+app.post('/api/rei/session/start', async (req, res) => {
+    const { clientAddress, description, selectedAgents, stakeTxIds, clientPublicKey } = req.body;
+    if (!clientAddress) return res.status(400).json({ error: 'Missing: clientAddress' });
+    if (!description) return res.status(400).json({ error: 'Missing: description' });
+    if (!selectedAgents || !Array.isArray(selectedAgents) || selectedAgents.length === 0) {
+        return res.status(400).json({ error: 'Missing: selectedAgents' });
+    }
+    if (!stakeTxIds || !Array.isArray(stakeTxIds)) {
+        return res.status(400).json({ error: 'Missing: stakeTxIds' });
+    }
+    try {
+        const { sessionId, agents } = initSession(clientAddress, description, selectedAgents, stakeTxIds, clientPublicKey);
+        const firstAgent = await executeSession(sessionId);
+        res.json({ sessionId, firstAgent, subTask: firstAgent.subTask });
+    } catch (error: any) {
+        console.error('[Rei] /api/rei/session/start error:', error);
+        res.status(500).json({ error: error.message || 'Failed to start Rei session.' });
+    }
+});
+
+app.post('/api/rei/session/:sessionId/approve', async (req, res) => {
+    const { sessionId } = req.params;
+    try {
+        const result = await approveAndAdvance(sessionId);
+        res.json(result);
+    } catch (error: any) {
+        console.error('[Rei] /api/rei/session/:sessionId/approve error:', error);
+        res.status(400).json({ error: error.message || 'Approval failed.' });
+    }
+});
+
+app.post('/api/rei/session/:sessionId/reject', async (req, res) => {
+    const { sessionId } = req.params;
+    try {
+        const result = await rejectAndAdvance(sessionId);
+        res.json(result);
+    } catch (error: any) {
+        console.error('[Rei] /api/rei/session/:sessionId/reject error:', error);
+        res.status(400).json({ error: error.message || 'Rejection failed.' });
+    }
+});
+
+app.get('/api/rei/session/:sessionId/status', (req, res) => {
+    const { sessionId } = req.params;
+    const session = getSessionStatus(sessionId);
+    if (!session) {
+        return res.status(404).json({ error: 'Session not found.' });
+    }
+    res.json(session);
+});
 
 const PORT = process.env.PORT || 3001; 
 
