@@ -13,6 +13,8 @@ import agentRoutes from './routes/agentRoutes';
 import taskRoutes from './routes/taskRoutes';
 import { getReiRecommendation } from './services/rei';
 import { initSession, executeSession, approveAndAdvance, rejectAndAdvance, getSessionStatus } from './services/reiSessionManager';
+import { initX402Client } from './services/x402Service';
+import { initX402Server, getX402Middleware } from './services/x402Server';
 
 
 // Ensure BigInt values can be serialized to JSON
@@ -29,8 +31,21 @@ app.use(cors());
 app.use(helmet());
 app.use(express.json());
 
+// Initialize x402 (payment protocol)
+console.log('[Init] Setting up x402...');
+initX402Client().then(() => console.log('[Init] X402 client ready'));
+initX402Server().then(() => {
+    console.log('[Init] X402 server ready');
+    const middleware = getX402Middleware();
+    if (middleware) {
+        app.use('/api/tasks', middleware, taskRoutes);
+        console.log('[Init] X402 middleware applied to /api/tasks');
+    } else {
+        app.use('/api/tasks', taskRoutes);
+    }
+});
+
 app.use('/api/agents', agentRoutes);
-app.use('/api/tasks', taskRoutes);
 
 // ── Rei Routes ──────────────────────────────────────────────────────────
 app.post('/api/rei/analyze', async (req, res) => {
