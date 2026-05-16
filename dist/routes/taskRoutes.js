@@ -6,6 +6,8 @@ const types_1 = require("../lib/types");
 const socket_1 = require("../lib/socket");
 const AuctionService_1 = require("../services/AuctionService");
 const taskExecutor_1 = require("../services/taskExecutor");
+const contracts_1 = require("../algorand/contracts");
+const algokit_utils_1 = require("@algorandfoundation/algokit-utils");
 const router = (0, express_1.Router)();
 const auctionService = new AuctionService_1.AuctionService();
 // ── Keyword-based lane detection ─────────────────────────────────────
@@ -66,15 +68,25 @@ router.post('/match', async (req, res) => {
                 });
             }
         }
-        const allAgents = [...agents, ...secondaryAgents].map(a => ({
-            ...a,
-            name: a.name || `Agent ${a.address.substring(0, 8)}`,
-            taskCount: Number(a.tasksCompleted),
-            successRate: 100,
-            totalEarned: Number(a.totalEarnedUsdc) / 1_000_000,
-            commitmentExpiry: a.listingExpiry ? new Date(a.listingExpiry).getTime() : Date.now() + 30 * 24 * 60 * 60 * 1000,
-            isPrimaryMatch: agents.some(pa => pa.id === a.id),
-        }));
+        const allAgents = [...agents, ...secondaryAgents].map(a => {
+            const lanePrefix = a.id.split('-')[0] || 'agent';
+            const idSuffix = a.id.split('-').slice(1).join('-') || a.id;
+            const displayName = `Agent ${lanePrefix.charAt(0).toUpperCase() + lanePrefix.slice(1)}-${idSuffix.toUpperCase()}`;
+            const successRate = Math.max(0, 100 - (Number(a.tasksFailed) * 20));
+            return {
+                id: a.id,
+                address: a.address,
+                senseiAddress: a.senseiAddress,
+                lane: a.lane.toLowerCase(),
+                status: a.status,
+                name: displayName,
+                taskCount: Number(a.tasksCompleted) + Number(a.tasksFailed),
+                successRate,
+                totalEarned: Number(a.totalEarnedUsdc),
+                commitmentExpiry: a.listingExpiry ? new Date(a.listingExpiry).getTime() : Date.now() + 30 * 24 * 60 * 60 * 1000,
+                isPrimaryMatch: agents.some(pa => pa.id === a.id),
+            };
+        });
         res.json({
             detectedLane: detection.lane,
             confidence: detection.confidence,
@@ -89,7 +101,7 @@ router.post('/match', async (req, res) => {
 });
 // Client: Post a new task requirement (called from /hire page)
 router.post('/', async (req, res) => {
-    const { title, description, lane, bountyUsdc, clientAddress, deadlineDays, stakeTxId, agentAddress, agentId: reqAgentId } = req.body;
+    const { title, description, lane, bountyUsdc, clientAddress, deadlineDays, stakeTxId, agentAddress, agentId: reqAgentId, id: requestedId, clientPublicKey } = req.body;
     try {
         const deadline = new Date();
         deadline.setDate(deadline.getDate() + (deadlineDays || 7));
@@ -99,14 +111,17 @@ router.post('/', async (req, res) => {
             const agent = await prisma_1.prisma.agent.findFirst({ where: { address: agentAddress, status: 'ACTIVE' } });
             agentId = agent?.id || null;
         }
+        // Use the on-chain taskId from frontend if provided, so the DB ID matches the EscrowVault box key
+        const taskId = requestedId || crypto.randomUUID();
         const task = await prisma_1.prisma.task.create({
             data: {
-                id: crypto.randomUUID(),
+                id: taskId,
                 title: title || null,
                 description: description || null,
                 lane: lane || 'RESEARCH',
                 bountyUsdc: BigInt(bountyUsdc || 0),
                 clientAddress: clientAddress || 'unknown',
+                clientPublicKey: clientPublicKey || null,
                 agentId,
                 workerAddress: agentAddress || null,
                 state: types_1.TaskState.CREATED,
@@ -217,6 +232,95 @@ router.delete('/:id', async (req, res) => {
     }
     catch (error) {
         res.status(500).json({ error: 'Failed to cleanup task' });
+    }
+});
+// Client approves task - release payment to sensei
+router.post('/:id/release', async (req, res) => {
+    const { id: taskId } = req.params;
+    const { callerAddress } = req.body;
+    try {
+        const task = await prisma_1.prisma.task.findUnique({
+            where: { id: taskId },
+            include: { agent: true }
+        });
+        if (!task)
+            return res.status(404).json({ error: 'Task not found' });
+        if (task.state !== types_1.TaskState.SUBMITTED)
+            return res.status(400).json({ error: 'Task not in SUBMITTED state' });
+        if (task.clientAddress !== callerAddress)
+            return res.status(403).json({ error: 'Not authorized' });
+        const senseiAddress = task.agent?.senseiAddress;
+        const treasuryAddress = process.env.TREASURY_ADDRESS || contracts_1.adminAddress;
+        console.log(`[TaskRoutes] Releasing payment for task ${taskId}...`);
+        const releaseResult = await contracts_1.escrowClient.send.releasePayment({
+            args: { taskId, treasury: treasuryAddress },
+            boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
+            accountReferences: [treasuryAddress, senseiAddress].filter(Boolean),
+            extraFee: (0, algokit_utils_1.microAlgos)(2000),
+        });
+        await prisma_1.prisma.task.update({
+            where: { id: taskId },
+            data: { state: types_1.TaskState.SETTLED, settledAt: new Date() }
+        });
+        if (task.agentId) {
+            await prisma_1.prisma.agent.update({
+                where: { id: task.agentId },
+                data: { tasksCompleted: { increment: 1 }, totalEarnedUsdc: { increment: task.bountyUsdc } }
+            });
+        }
+        res.json({ success: true, txId: releaseResult.transaction.txID() });
+    }
+    catch (error) {
+        console.error('[TaskRoutes] Release failed:', error);
+        res.status(500).json({ error: error.message || 'Failed to release payment' });
+    }
+});
+// Client rejects task - slash and refund
+router.post('/:id/slash', async (req, res) => {
+    const { id: taskId } = req.params;
+    const { callerAddress } = req.body;
+    try {
+        const task = await prisma_1.prisma.task.findUnique({
+            where: { id: taskId },
+            include: { agent: true }
+        });
+        if (!task)
+            return res.status(404).json({ error: 'Task not found' });
+        if (task.state !== types_1.TaskState.SUBMITTED)
+            return res.status(400).json({ error: 'Task not in SUBMITTED state' });
+        if (task.clientAddress !== callerAddress)
+            return res.status(403).json({ error: 'Not authorized' });
+        console.log(`[TaskRoutes] Slashing task ${taskId}...`);
+        // Refund client
+        await contracts_1.escrowClient.send.slashBounty({
+            args: { taskId },
+            boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
+            accountReferences: [task.clientAddress].filter(Boolean),
+            extraFee: (0, algokit_utils_1.microAlgos)(1000),
+        });
+        // Slash sensei stake
+        if (task.agentId && task.agent?.senseiAddress) {
+            const treasuryAddr = process.env.TREASURY_ADDRESS || contracts_1.adminAddress;
+            await contracts_1.commitmentClient.send.slashStake({
+                args: { stakeId: task.agentId },
+                boxReferences: [{ appId: BigInt(process.env.COMMITMENT_LOCK_APP_ID || '0'), name: new Uint8Array(Buffer.from(task.agentId)) }],
+                accountReferences: [treasuryAddr],
+                extraFee: (0, algokit_utils_1.microAlgos)(1000),
+            });
+            await prisma_1.prisma.agent.update({
+                where: { id: task.agentId },
+                data: { tasksFailed: { increment: 1 } }
+            });
+        }
+        await prisma_1.prisma.task.update({
+            where: { id: taskId },
+            data: { state: types_1.TaskState.SLASHED }
+        });
+        res.json({ success: true });
+    }
+    catch (error) {
+        console.error('[TaskRoutes] Slash failed:', error);
+        res.status(500).json({ error: error.message || 'Failed to slash' });
     }
 });
 exports.default = router;

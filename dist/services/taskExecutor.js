@@ -10,8 +10,43 @@ const types_1 = require("../lib/types");
 const socket_1 = require("../lib/socket");
 const configVault_1 = require("./configVault");
 const contracts_1 = require("../algorand/contracts");
+const algokit_utils_1 = require("@algorandfoundation/algokit-utils");
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
+const crypto_1 = __importDefault(require("crypto"));
+function encryptHybrid(plainText, publicKeyBase64) {
+    try {
+        // 1. Generate random AES-256-GCM key
+        const aesKey = crypto_1.default.randomBytes(32);
+        const iv = crypto_1.default.randomBytes(16);
+        // 2. Encrypt data with AES
+        const cipher = crypto_1.default.createCipheriv('aes-256-gcm', aesKey, iv);
+        const encryptedData = Buffer.concat([
+            cipher.update(plainText, 'utf8'),
+            cipher.final()
+        ]);
+        const authTag = cipher.getAuthTag();
+        // 3. Encrypt AES key with RSA public key
+        const publicKey = crypto_1.default.createPublicKey({
+            key: Buffer.from(publicKeyBase64, 'base64'),
+            type: 'spki',
+            format: 'der'
+        });
+        const encryptedAesKey = crypto_1.default.publicEncrypt({
+            key: publicKey,
+            padding: crypto_1.default.constants.RSA_PKCS1_OAEP_PADDING,
+            oaepHash: 'sha256'
+        }, aesKey);
+        // 4. Combine: IV (16) + AuthTag (16) + EncryptedAESKey + EncryptedData
+        const combined = Buffer.concat([iv, authTag, encryptedAesKey, encryptedData]);
+        return combined.toString('base64');
+    }
+    catch (error) {
+        console.error('[Encryption] Failed to encrypt output:', error);
+        return null;
+        return plainText;
+    }
+}
 const LANE_PROMPTS = {
     RESEARCH: `You are an elite research analyst for the 0rca Swarm Dojo — a decentralized AI agent marketplace on Algorand. 
 Your job is to produce comprehensive, data-driven research reports. 
@@ -130,81 +165,55 @@ class TaskExecutor {
             });
             const result = completion.choices[0]?.message?.content || 'No output generated.';
             console.log(`[TaskExecutor] AI response received (${result.length} chars)`);
-            // 5. Update state to SUBMITTED with the result
+            // 5. Encrypt result with client's public key before storing
+            let encryptedResult = null;
+            console.log(`[TaskExecutor] Client public key:`, task.clientPublicKey ? 'EXISTS' : 'MISSING');
+            if (task.clientPublicKey) {
+                const encrypted = encryptHybrid(result, task.clientPublicKey);
+                if (encrypted) {
+                    encryptedResult = encrypted;
+                    console.log(`[TaskExecutor] Output encrypted (hybrid), length:`, encryptedResult.length);
+                }
+                else {
+                    console.error('[TaskExecutor] Encryption failed');
+                }
+            }
+            else {
+                console.warn(`[TaskExecutor] No clientPublicKey found - using plain result`);
+            }
+            // 5. Update state to SUBMITTED with the encrypted result
             await prisma_1.prisma.task.update({
                 where: { id: taskId },
                 data: {
                     state: types_1.TaskState.SUBMITTED,
-                    result
+                    result: null,
+                    encryptedResult
                 }
             });
             (0, socket_1.broadcast)('TASK_STATUS', { taskId, state: types_1.TaskState.SUBMITTED, timestamp: new Date() });
-            // 6. On-chain settlement: release 98% bounty to sensei, 2% to platform treasury
-            const senseiAddress = task.agent?.senseiAddress;
-            const treasuryAddress = process.env.TREASURY_ADDRESS || contracts_1.adminAddress;
-            console.log(`[TaskExecutor] Initiating on-chain settlement for ${taskId}...`);
-            console.log(`[TaskExecutor] Sensei: ${senseiAddress}, Treasury: ${treasuryAddress}`);
-            try {
-                const releaseResult = await contracts_1.escrowClient.send.releasePayment({
-                    args: {
-                        taskId,
-                        treasury: treasuryAddress
-                    },
-                    boxReferences: [
-                        { appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }
-                    ]
-                });
-                console.log(`[TaskExecutor] ✅ On-chain settlement successful for ${taskId}. TxId: ${releaseResult.transaction.txID()}`);
-                console.log(`[TaskExecutor]    → 2% platform fee sent to treasury (${treasuryAddress})`);
-                console.log(`[TaskExecutor]    → 98% bounty sent to sensei (${senseiAddress})`);
-            }
-            catch (onChainErr) {
-                console.error(`[TaskExecutor] WARNING: On-chain settlement failed for ${taskId}:`, onChainErr.message || onChainErr);
-                // We still update DB so the UI shows progress, but we log the failure
-            }
-            await prisma_1.prisma.task.update({
-                where: { id: taskId },
-                data: {
-                    state: types_1.TaskState.SETTLED,
-                    settledAt: new Date()
-                }
-            });
-            // 7. INSTANT Real-time Stats Update
-            if (task.agentId) {
-                await prisma_1.prisma.agent.update({
-                    where: { id: task.agentId },
-                    data: {
-                        tasksCompleted: { increment: 1 },
-                        totalEarnedUsdc: { increment: task.bountyUsdc }
-                    }
-                });
-                console.log(`[TaskExecutor] ✅ Instant stats updated for Agent: ${task.agentId} (+${task.bountyUsdc} microAlgos)`);
-            }
-            // 8. Broadcast the settlement event for real-time UI refresh
-            (0, socket_1.broadcast)('TASK_SETTLED', {
-                ...task,
-                state: types_1.TaskState.SETTLED,
-                settledAt: new Date()
-            });
-            // 9. Broadcast the final result to all connected clients
+            // 6. WAIT for client approval - do NOT auto-release payment
+            // Payment will be released when user clicks "Satisfied" via /api/tasks/:id/release
+            // Or slashed when user clicks "Not Satisfied" via /api/tasks/:id/slash
+            console.log(`[TaskExecutor] ✅ Task ${taskId} output ready. Waiting for client approval...`);
+            console.log(`[TaskExecutor]    State: SUBMITTED. Payment will be released on approval.`);
+            // 7. Broadcast the result - client must approve to release payment
             (0, socket_1.broadcast)('TASK_RESULT', {
                 taskId,
-                state: types_1.TaskState.SETTLED,
-                result,
+                state: types_1.TaskState.SUBMITTED,
+                encryptedResult,
                 lane: task.lane,
                 agentId: task.agentId,
                 agentName: task.agent?.id || 'Unknown',
                 senseiAddress,
                 bountyUsdc: task.bountyUsdc.toString(),
-                settledAt: new Date(),
                 timestamp: new Date()
             });
-            console.log(`[TaskExecutor] ✅ Task ${taskId} finalized and broadcasted.`);
+            console.log(`[TaskExecutor] ✅ Task ${taskId} output generated and broadcasted. Awaiting approval.`);
         }
         catch (error) {
             console.error(`[TaskExecutor] ❌ Failed for task ${taskId}:`, error.message || error);
             // ═══════════════════════════════════════════════════════════════
-            // ON-CHAIN SLASH: Refund user's bounty + take 1% from developer
+            // ON-CHAIN SLASH: Refund user's bounty + take 10% from developer
             // ═══════════════════════════════════════════════════════════════
             if (task) {
                 // 1. Slash the EscrowVault — return 100% of user's bounty to their wallet
@@ -214,23 +223,46 @@ class TaskExecutor {
                         args: { taskId },
                         boxReferences: [
                             { appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }
-                        ]
+                        ],
+                        accountReferences: [task.clientAddress].filter(Boolean),
+                        extraFee: (0, algokit_utils_1.microAlgos)(1000),
                     });
                     console.log(`[TaskExecutor] ✅ EscrowVault slash successful — user bounty refunded. TxId: ${slashResult.transaction.txID()}`);
+                    // Notify frontend about the bounty refund
+                    (0, socket_1.broadcast)('BOUNTY_REFUNDED', {
+                        taskId,
+                        clientAddress: task.clientAddress,
+                        bountyAmount: task.bountyUsdc.toString(),
+                        txId: slashResult.transaction.txID(),
+                        timestamp: new Date()
+                    });
                 }
                 catch (slashErr) {
                     console.error(`[TaskExecutor] WARNING: EscrowVault slash failed for ${taskId}:`, slashErr.message || slashErr);
                 }
-                // 2. Slash the CommitmentLock — take 1% from developer's stake to treasury
+                // 2. Slash the CommitmentLock — take 10% from developer's stake to treasury
                 if (task.agentId) {
                     try {
+                        const treasuryAddr = process.env.TREASURY_ADDRESS || contracts_1.adminAddress;
                         const commitSlashResult = await contracts_1.commitmentClient.send.slashStake({
                             args: { stakeId: task.agentId },
                             boxReferences: [
                                 { appId: BigInt(process.env.COMMITMENT_LOCK_APP_ID || '0'), name: new Uint8Array(Buffer.from(task.agentId)) }
-                            ]
+                            ],
+                            accountReferences: [treasuryAddr],
+                            extraFee: (0, algokit_utils_1.microAlgos)(1000),
                         });
-                        console.log(`[TaskExecutor] ✅ CommitmentLock slash successful — 1% of developer stake sent to treasury. TxId: ${commitSlashResult.transaction.txID()}`);
+                        console.log(`[TaskExecutor] ✅ CommitmentLock slash successful — 10% of developer stake sent to treasury. TxId: ${commitSlashResult.transaction.txID()}`);
+                        // Notify frontend about the collateral slash
+                        (0, socket_1.broadcast)('COLLATERAL_SLASHED', {
+                            taskId,
+                            agentId: task.agentId,
+                            senseiAddress: task.agent?.senseiAddress,
+                            treasuryAddress: treasuryAddr,
+                            slashPercentage: 10,
+                            txId: commitSlashResult.transaction.txID(),
+                            timestamp: new Date()
+                        });
                     }
                     catch (commitSlashErr) {
                         console.error(`[TaskExecutor] WARNING: CommitmentLock slash failed for agent ${task.agentId}:`, commitSlashErr.message || commitSlashErr);
@@ -264,11 +296,18 @@ class TaskExecutor {
                 }
             }
             try {
+                // Encrypt error message if client public key exists
+                const errorMessage = `Task Failed: ${error.message || 'Unknown Error'}`;
+                let encryptedError = null;
+                if (task?.clientPublicKey) {
+                    encryptedError = encryptHybrid(errorMessage, task.clientPublicKey);
+                }
                 await prisma_1.prisma.task.update({
                     where: { id: taskId },
                     data: {
                         state: types_1.TaskState.SLASHED,
-                        result: `Task Failed: ${error.message || 'Unknown Error'}`
+                        result: null,
+                        encryptedResult: encryptedError
                     }
                 });
                 (0, socket_1.broadcast)('TASK_STATUS', {

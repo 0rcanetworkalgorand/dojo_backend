@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.VerificationService = void 0;
 const contracts_1 = require("../algorand/contracts");
+const algokit_utils_1 = require("@algorandfoundation/algokit-utils");
 const types_1 = require("../lib/types");
 const prisma_1 = require("../lib/prisma");
 class VerificationService {
@@ -34,7 +35,12 @@ class VerificationService {
                 // Perform on-chain settlement with platform fee (2% handled in contract)
                 // We pass treasury to the updated releasePayment method
                 await contracts_1.escrowClient.send.releasePayment({
-                    args: { taskId, treasury }
+                    args: { taskId, treasury },
+                    boxReferences: [
+                        { appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }
+                    ],
+                    accountReferences: [treasury, task.agent?.senseiAddress].filter(Boolean),
+                    extraFee: (0, algokit_utils_1.microAlgos)(2000),
                 });
                 // Increment successful tasks in Registry
                 if (task.agent?.address) {

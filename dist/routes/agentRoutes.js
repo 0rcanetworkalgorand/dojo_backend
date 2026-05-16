@@ -26,14 +26,27 @@ router.get('/', async (req, res) => {
             where,
         });
         const mapped = agents.map(a => {
-            // [DEMO LOGIC] Success rate starts at 100% and drops by 20% for each failed task
+            // Success rate starts at 100% and drops by 20% for each failed task
             const successRate = Math.max(0, 100 - (Number(a.tasksFailed) * 20));
-            // Keep in microAlgos (base units) so frontend formatters work correctly
             const totalEarned = Number(a.totalEarnedUsdc);
+            // Generate a clean display name from the agent ID (e.g. "data-y42bsr" → "Agent Data-Y42BSR")
+            const lanePrefix = a.id.split('-')[0] || 'agent';
+            const idSuffix = a.id.split('-').slice(1).join('-') || a.id;
+            const displayName = `Agent ${lanePrefix.charAt(0).toUpperCase() + lanePrefix.slice(1)}-${idSuffix.toUpperCase()}`;
             return {
-                ...a,
+                id: a.id,
                 address: a.address,
-                name: a.name || (a.id.includes('data-9') ? 'agent data-9' : `Agent ${a.address.substring(0, 6)}`),
+                senseiAddress: a.senseiAddress,
+                lane: a.lane.toLowerCase(), // Frontend Lane type uses lowercase
+                status: a.status,
+                configHash: a.configHash,
+                tasksCompleted: Number(a.tasksCompleted),
+                tasksFailed: Number(a.tasksFailed),
+                totalEarnedUsdc: Number(a.totalEarnedUsdc),
+                listingExpiry: a.listingExpiry,
+                createdAt: a.createdAt,
+                updatedAt: a.updatedAt,
+                name: displayName,
                 taskCount: Number(a.tasksCompleted) + Number(a.tasksFailed),
                 successRate,
                 totalEarned,
@@ -178,6 +191,7 @@ router.post('/register', async (req, res) => {
         const agent = await prisma_1.prisma.agent.upsert({
             where: { id: agentId },
             update: {
+                address: wallet.addr,
                 senseiAddress,
                 lane: lane.toUpperCase(),
                 configHash: configHash.toString('hex'),
@@ -185,7 +199,7 @@ router.post('/register', async (req, res) => {
             },
             create: {
                 id: agentId,
-                address: agentId,
+                address: wallet.addr,
                 senseiAddress,
                 lane: lane.toUpperCase(),
                 configHash: configHash.toString('hex'),
