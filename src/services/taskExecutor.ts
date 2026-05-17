@@ -229,7 +229,7 @@ export class TaskExecutor {
                 lane: task.lane,
                 agentId: task.agentId,
                 agentName: task.agent?.id || 'Unknown',
-                senseiAddress,
+                senseiAddress: task.agent?.senseiAddress || '',
                 bountyUsdc: task.bountyUsdc.toString(),
                 timestamp: new Date()
             });
