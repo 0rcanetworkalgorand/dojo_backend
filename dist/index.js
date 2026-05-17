@@ -31,7 +31,7 @@ app.use(express_1.default.json());
 // Initialize x402 (payment protocol)
 console.log('[Init] Setting up x402...');
 (0, x402Service_1.initX402Client)().then(() => console.log('[Init] X402 client ready'));
-const x402ServerReady = (0, x402Server_1.initX402Server)().then(() => {
+(0, x402Server_1.initX402Server)().then(() => {
     console.log('[Init] X402 server ready');
     const middleware = (0, x402Server_1.getX402Middleware)();
     if (middleware) {

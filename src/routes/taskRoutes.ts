@@ -270,17 +270,26 @@ router.post('/:id/release', async (req, res) => {
         if (task.state !== TaskState.SUBMITTED) return res.status(400).json({ error: 'Task not in SUBMITTED state' });
         if (task.clientAddress !== callerAddress) return res.status(403).json({ error: 'Not authorized' });
         
-        const senseiAddress = task.agent?.senseiAddress;
-        const treasuryAddress = process.env.TREASURY_ADDRESS || adminAddress;
-        
         console.log(`[TaskRoutes] Releasing payment for task ${taskId}...`);
         
-        const releaseResult = await escrowClient.send.releasePayment({
-            args: { taskId, treasury: treasuryAddress },
-            boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
-            accountReferences: [treasuryAddress, senseiAddress].filter(Boolean) as string[],
-            extraFee: microAlgos(2000),
-        });
+        let txId: string | undefined;
+        
+        // If no workerAddress, this is an x402 task (no stake) - just mark as settled
+        if (!task.workerAddress) {
+            console.log('[TaskRoutes] x402 task (no stake) - marking as SETTLED');
+            txId = 'x402-no-stake';
+        } else {
+            const senseiAddress = task.agent?.senseiAddress;
+            const treasuryAddress = process.env.TREASURY_ADDRESS || adminAddress;
+            console.log('[TaskRoutes] On-chain task - releasing via escrow');
+            const releaseResult = await escrowClient.send.releasePayment({
+                args: { taskId, treasury: treasuryAddress },
+                boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
+                accountReferences: [treasuryAddress, senseiAddress].filter(Boolean) as string[],
+                extraFee: microAlgos(2000),
+            });
+            txId = releaseResult.transaction.txID();
+        }
         
         await prisma.task.update({
             where: { id: taskId },
@@ -294,7 +303,7 @@ router.post('/:id/release', async (req, res) => {
             });
         }
         
-        res.json({ success: true, txId: releaseResult.transaction.txID() });
+        res.json({ success: true, txId: txId });
     } catch (error: any) {
         console.error('[TaskRoutes] Release failed:', error);
         res.status(500).json({ error: error.message || 'Failed to release payment' });
@@ -318,28 +327,32 @@ router.post('/:id/slash', async (req, res) => {
         
         console.log(`[TaskRoutes] Slashing task ${taskId}...`);
         
-        // Refund client
-        await escrowClient.send.slashBounty({
-            args: { taskId },
-            boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
-            accountReferences: [task.clientAddress].filter(Boolean),
-            extraFee: microAlgos(1000),
-        });
-        
-        // Slash sensei stake
-        if (task.agentId && task.agent?.senseiAddress) {
-            const treasuryAddr = process.env.TREASURY_ADDRESS || adminAddress;
-            await commitmentClient.send.slashStake({
-                args: { stakeId: task.agentId },
-                boxReferences: [{ appId: BigInt(process.env.COMMITMENT_LOCK_APP_ID || '0'), name: new Uint8Array(Buffer.from(task.agentId)) }],
-                accountReferences: [treasuryAddr],
+        // If no workerAddress, this is an x402 task (no stake) - just mark as SLASHED
+        if (!task.workerAddress) {
+            console.log('[TaskRoutes] x402 task (no stake) - marking as SLASHED');
+        } else {
+            console.log('[TaskRoutes] On-chain task - slashing via escrow');
+            await escrowClient.send.slashBounty({
+                args: { taskId },
+                boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
+                accountReferences: [task.clientAddress].filter(Boolean),
                 extraFee: microAlgos(1000),
             });
             
-            await prisma.agent.update({
-                where: { id: task.agentId },
-                data: { tasksFailed: { increment: 1 } }
-            });
+            if (task.agentId && task.agent?.senseiAddress) {
+                const treasuryAddr = process.env.TREASURY_ADDRESS || adminAddress;
+                await commitmentClient.send.slashStake({
+                    args: { stakeId: task.agentId },
+                    boxReferences: [{ appId: BigInt(process.env.COMMITMENT_LOCK_APP_ID || '0'), name: new Uint8Array(Buffer.from(task.agentId)) }],
+                    accountReferences: [treasuryAddr],
+                    extraFee: microAlgos(1000),
+                });
+                
+                await prisma.agent.update({
+                    where: { id: task.agentId },
+                    data: { tasksFailed: { increment: 1 } }
+                });
+            }
         }
         
         await prisma.task.update({

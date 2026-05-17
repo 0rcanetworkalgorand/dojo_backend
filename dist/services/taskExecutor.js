@@ -11,6 +11,7 @@ const socket_1 = require("../lib/socket");
 const configVault_1 = require("./configVault");
 const contracts_1 = require("../algorand/contracts");
 const algokit_utils_1 = require("@algorandfoundation/algokit-utils");
+const resolutionAgent_1 = require("./resolutionAgent");
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
 const crypto_1 = __importDefault(require("crypto"));
@@ -163,8 +164,49 @@ class TaskExecutor {
                     { role: 'user', content: userPrompt }
                 ]
             });
-            const result = completion.choices[0]?.message?.content || 'No output generated.';
+            let result = completion.choices[0]?.message?.content || 'No output generated.';
             console.log(`[TaskExecutor] AI response received (${result.length} chars)`);
+            // 4b. Validate output with Resolution Agent
+            console.log(`[TaskExecutor] Running Resolution Agent validation...`);
+            let validation;
+            let retryCount = 0;
+            const maxRetries = 2;
+            while (retryCount <= maxRetries) {
+                validation = await resolutionAgent_1.resolutionAgent.validate({
+                    output: result,
+                    task: {
+                        description: task.description || task.title || '',
+                        lane: task.lane,
+                        title: task.title || ''
+                    }
+                });
+                console.log(`[TaskExecutor] Validation score: ${validation.score}/10, decision: ${validation.decision}, issues: ${validation.issues.join(', ') || 'none'}`);
+                if (validation.decision === 'retry' && retryCount < maxRetries) {
+                    console.log(`[TaskExecutor] Validation failed, retrying (${retryCount + 1}/${maxRetries})...`);
+                    retryCount++;
+                    const retryCompletion = await client.chat.completions.create({
+                        model: params.model,
+                        max_tokens: params.max_tokens,
+                        temperature: params.temperature,
+                        messages: [
+                            { role: 'system', content: systemPrompt + '\n\nIMPORTANT: Your previous output was rejected due to: ' + validation.issues.join(', ') + '. Please improve.' },
+                            { role: 'user', content: userPrompt }
+                        ]
+                    });
+                    result = retryCompletion.choices[0]?.message?.content || result;
+                }
+                else {
+                    break;
+                }
+            }
+            const finalValidation = validation;
+            const validationSummary = {
+                score: finalValidation.score,
+                issues: finalValidation.issues,
+                decision: finalValidation.decision,
+                retryCount: retryCount
+            };
+            console.log(`[TaskExecutor] Final validation: score=${finalValidation.score}, decision=${finalValidation.decision}, retries=${retryCount}`);
             // 5. Encrypt result with client's public key before storing
             let encryptedResult = null;
             console.log(`[TaskExecutor] Client public key:`, task.clientPublicKey ? 'EXISTS' : 'MISSING');
@@ -204,8 +246,11 @@ class TaskExecutor {
                 lane: task.lane,
                 agentId: task.agentId,
                 agentName: task.agent?.id || 'Unknown',
-                senseiAddress,
+                senseiAddress: task.agent?.senseiAddress || '',
                 bountyUsdc: task.bountyUsdc.toString(),
+                validationScore: validationSummary.score,
+                validationIssues: validationSummary.issues,
+                validationDecision: validationSummary.decision,
                 timestamp: new Date()
             });
             console.log(`[TaskExecutor] ✅ Task ${taskId} output generated and broadcasted. Awaiting approval.`);
