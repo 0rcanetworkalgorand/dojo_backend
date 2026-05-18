@@ -253,21 +253,15 @@ router.get('/stats/:address', async (req, res) => {
             where: { senseiAddress: address }
         });
 
-        const agentAddresses = agents.map(a => a.address);
-        
-        const tasks = await prisma.task.findMany({
-            where: {
-                OR: [
-                    { clientAddress: address },
-                    { workerAddress: { in: agentAddresses } }
-                ]
-            } 
-        });
+        const totalCompleted = agents.reduce((sum, a) => sum + Number(a.tasksCompleted), 0);
+        const totalFailed = agents.reduce((sum, a) => sum + Number(a.tasksFailed), 0);
+        const totalTasks = totalCompleted + totalFailed;
 
         const stats = {
             totalAgents: agents.length,
-            tasksToday: tasks.filter(t => t.createdAt > new Date(Date.now() - 86400000)).length,
-            usdcVolume: agents.reduce((sum, a) => sum + Number(a.totalEarnedUsdc), 0),
+            tasksToday: totalTasks,
+            successRate: totalTasks > 0 ? totalCompleted / totalTasks : 1,
+            totalVolume: agents.reduce((sum, a) => sum + Number(a.totalEarnedUsdc), 0),
         };
         
         console.log(`[Stats API] Returning stats for ${address}:`, stats);
