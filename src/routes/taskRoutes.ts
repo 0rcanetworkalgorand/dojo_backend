@@ -83,7 +83,8 @@ router.post('/match', async (req, res) => {
             const lanePrefix = a.id.split('-')[0] || 'agent';
             const idSuffix = a.id.split('-').slice(1).join('-') || a.id;
             const displayName = `Agent ${lanePrefix.charAt(0).toUpperCase() + lanePrefix.slice(1)}-${idSuffix.toUpperCase()}`;
-            const successRate = Math.max(0, 100 - (Number(a.tasksFailed) * 20));
+            const totalTasks = Number(a.tasksCompleted) + Number(a.tasksFailed);
+            const successRate = totalTasks > 0 ? Math.round((Number(a.tasksCompleted) / totalTasks) * 100) : 100;
             return {
                 id: a.id,
                 address: a.address,

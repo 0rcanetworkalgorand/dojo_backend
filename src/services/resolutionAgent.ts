@@ -20,10 +20,23 @@ export interface ValidationOutput {
 }
 
 export class ResolutionAgent {
-  private openaiApiKey: string;
+  private apiKey: string;
+  private apiUrl: string;
+  private model: string;
 
   constructor() {
-    this.openaiApiKey = process.env.OPENAI_API_KEY || process.env.GROQ_API_KEY || '';
+    const groqKey = process.env.GROQ_API_KEY || '';
+    const openaiKey = process.env.OPENAI_API_KEY || '';
+    
+    if (groqKey) {
+      this.apiKey = groqKey;
+      this.apiUrl = 'https://api.groq.com/openai/v1/chat/completions';
+      this.model = 'llama-3.1-8b-instant';
+    } else {
+      this.apiKey = openaiKey;
+      this.apiUrl = 'https://api.openai.com/v1/chat/completions';
+      this.model = 'gpt-3.5-turbo';
+    }
   }
 
   async validate(input: ValidationInput): Promise<ValidationOutput> {
@@ -179,7 +192,7 @@ export class ResolutionAgent {
   }
 
   private async llmJudgeScore(output: string, description: string, lane: string): Promise<number> {
-    if (!this.openaiApiKey) {
+    if (!this.apiKey) {
       console.warn('[ResolutionAgent] No API key configured, using fallback scoring');
       return 5;
     }
@@ -199,14 +212,14 @@ Respond with ONLY a JSON object:
 {"score": X, "issues": ["issue1", "issue2"]}
 Score 8-10 = excellent, 5-7 = average, below 5 = poor.`;
 
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch(this.apiUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.openaiApiKey}`
+        'Authorization': `Bearer ${this.apiKey}`
       },
       body: JSON.stringify({
-        model: 'gpt-3.5-turbo',
+        model: this.model,
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
         max_tokens: 200
@@ -239,11 +252,16 @@ Score 8-10 = excellent, 5-7 = average, below 5 = poor.`;
     let finalScore: number;
     let decision: 'auto-approve' | 'flag' | 'retry';
 
+    // Normalize each layer to 0-10 scale
+    const ruleNormalized = (ruleResult.score / 4) * 10;
+    const laneNormalized = laneResult.total > 0 ? (laneResult.score / laneResult.total) * 10 : 5;
+
     if (llmScore !== undefined) {
-      finalScore = Math.round((ruleResult.score * 2 + laneResult.score + llmScore) / 4);
+      // Weighted: 20% rule checks, 30% lane checks, 50% LLM judge
+      finalScore = Math.round(ruleNormalized * 0.2 + laneNormalized * 0.3 + llmScore * 0.5);
     } else {
-      const maxPossible = 4 + laneResult.total;
-      finalScore = Math.round(((ruleResult.score + laneResult.score) / maxPossible) * 10);
+      // No LLM available: 40% rule checks, 60% lane checks, capped at 7 (can't auto-approve without LLM)
+      finalScore = Math.min(7, Math.round(ruleNormalized * 0.4 + laneNormalized * 0.6));
     }
 
     finalScore = Math.max(0, Math.min(10, finalScore));

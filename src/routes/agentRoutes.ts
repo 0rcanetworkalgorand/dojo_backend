@@ -23,8 +23,8 @@ router.get('/', async (req, res) => {
         });
 
         const mapped = agents.map(a => {
-            // Success rate starts at 100% and drops by 20% for each failed task
-            const successRate = Math.max(0, 100 - (Number(a.tasksFailed) * 20));
+            const totalTasks = Number(a.tasksCompleted) + Number(a.tasksFailed);
+            const successRate = totalTasks > 0 ? Math.round((Number(a.tasksCompleted) / totalTasks) * 100) : 100;
             const totalEarned = Number(a.totalEarnedUsdc); 
             
             // Generate a clean display name from the agent ID (e.g. "data-y42bsr" → "Agent Data-Y42BSR")
