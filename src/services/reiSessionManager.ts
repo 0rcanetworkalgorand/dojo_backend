@@ -5,6 +5,7 @@ import { escrowClient, commitmentClient, adminAddress } from '../algorand/contra
 import { microAlgos } from '@algorandfoundation/algokit-utils';
 import OpenAI from 'openai';
 import { SelectedAgent } from './rei';
+import { resolutionAgent, ValidationOutput } from './resolutionAgent';
 import crypto from 'crypto';
 
 function encryptHybrid(plainText: string, publicKeyBase64: string): string | null {
@@ -43,7 +44,7 @@ function encryptHybrid(plainText: string, publicKeyBase64: string): string | nul
         return combined.toString('base64');
         
     } catch (error) {
-        console.error('[Rei Encryption] Failed:', error.message);
+        console.error('[Rei Encryption] Failed:', (error as Error).message);
         return null;
     }
 }
@@ -142,8 +143,40 @@ async function executeAgentTask(agent: SessionAgent, sessionId: string) {
             ]
         });
 
-        const result = completion.choices[0]?.message?.content || 'No output generated.';
+        let result = completion.choices[0]?.message?.content || 'No output generated.';
         console.log(`[Rei] AI output received (${result.length} chars)`);
+
+        // Run Resolution Agent validation
+        console.log(`[Rei] Running Resolution Agent validation...`);
+        let validation: ValidationOutput;
+        let retryCount = 0;
+        const maxRetries = 2;
+
+        while (retryCount <= maxRetries) {
+            validation = await resolutionAgent.validate({
+                output: result,
+                task: { description: agent.subTask || '', lane: agent.lane, title: `Rei Session: ${agent.lane}` }
+            });
+            console.log(`[Rei] Validation score: ${validation.score}/10, decision: ${validation.decision}`);
+
+            if (validation.decision === 'retry' && retryCount < maxRetries) {
+                retryCount++;
+                const retryCompletion = await client.chat.completions.create({
+                    model: params.model,
+                    max_tokens: params.max_tokens,
+                    temperature: params.temperature,
+                    messages: [
+                        { role: 'system', content: systemPrompt + '\n\nIMPORTANT: Your previous output was rejected due to: ' + validation.issues.join(', ') + '. Please improve.' },
+                        { role: 'user', content: userPrompt }
+                    ]
+                });
+                result = retryCompletion.choices[0]?.message?.content || result;
+            } else {
+                break;
+            }
+        }
+
+        const finalValidation = validation!;
 
         // Get task to check for clientPublicKey
         const task = await prisma.task.findUnique({ where: { id: taskId } });
@@ -166,8 +199,9 @@ async function executeAgentTask(agent: SessionAgent, sessionId: string) {
             where: { id: taskId },
             data: { 
                 state: TaskState.SUBMITTED, 
-                result: null,  // Don't store plain text
-                encryptedResult 
+                result: null,
+                encryptedResult,
+                validationScore: finalValidation.score
             }
         });
 
@@ -176,10 +210,13 @@ async function executeAgentTask(agent: SessionAgent, sessionId: string) {
             sessionId,
             taskId,
             lane: agent.lane,
-            encryptedResult: encryptedResult || result,  // Send encrypted or plain
+            encryptedResult: encryptedResult || result,
             agentAddress: agent.agentAddress,
             senseiAddress: agent.senseiAddress,
             subTask: agent.subTask,
+            validationScore: finalValidation.score,
+            validationDecision: finalValidation.decision,
+            validationIssues: finalValidation.issues,
             timestamp: new Date()
         });
 
@@ -305,8 +342,12 @@ async function startNextAgent(session: ReiSession) {
 
 async function createTasksInDb(sessionAgents: SessionAgent[], clientAddress: string, description: string, clientPublicKey?: string) {
     for (const agent of sessionAgents) {
-        await prisma.task.create({
-            data: {
+        // Look up the agent by address to get the DB id
+        const dbAgent = await prisma.agent.findFirst({ where: { address: agent.agentAddress } });
+        await prisma.task.upsert({
+            where: { id: agent.taskId },
+            update: { state: TaskState.CREATED },
+            create: {
                 id: agent.taskId,
                 title: `Rei Session: ${agent.lane}`,
                 description: agent.subTask || description,
@@ -314,13 +355,13 @@ async function createTasksInDb(sessionAgents: SessionAgent[], clientAddress: str
                 bountyUsdc: BigInt(0),
                 clientAddress,
                 clientPublicKey: clientPublicKey || null,
-                agentId: null,
+                agentId: dbAgent?.id || null,
                 workerAddress: agent.agentAddress,
                 state: TaskState.CREATED,
                 deadline: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
             }
         });
-        console.log(`[Rei] DB task created: ${agent.taskId} (${agent.lane})`);
+        console.log(`[Rei] DB task created: ${agent.taskId} (${agent.lane}) agentId: ${dbAgent?.id || 'none'}`);
     }
 }
 
@@ -386,6 +427,7 @@ export async function approveAndAdvance(sessionId: string): Promise<{
     sessionComplete: boolean;
     taskResult: string;
     taskId: string;
+    validationScore: number | null;
 }> {
     const session = sessions.get(sessionId);
     if (!session) throw new Error('Session not found');
@@ -399,6 +441,16 @@ export async function approveAndAdvance(sessionId: string): Promise<{
         await releasePaymentForTask(currentAgent.taskId, currentAgent.senseiAddress);
     } catch (err) {
         console.error(`[Rei] On-chain release failed:`, err);
+    }
+
+    // Update agent stats - increment tasksCompleted
+    const agent = await prisma.agent.findFirst({ where: { address: currentAgent.agentAddress } });
+    if (agent) {
+        await prisma.agent.update({
+            where: { id: agent.id },
+            data: { tasksCompleted: { increment: 1 }, totalEarnedUsdc: { increment: task?.bountyUsdc || BigInt(0) } }
+        });
+        console.log(`[Rei] ✅ Agent ${agent.id} tasksCompleted incremented`);
     }
 
     session.completedOutputs.push({
@@ -420,7 +472,8 @@ export async function approveAndAdvance(sessionId: string): Promise<{
         nextAgent,
         sessionComplete: session.status === 'COMPLETE',
         taskResult: task?.result || '',
-        taskId: currentAgent.taskId
+        taskId: currentAgent.taskId,
+        validationScore: task?.validationScore ?? null
     };
 }
 
@@ -429,6 +482,7 @@ export async function rejectAndAdvance(sessionId: string): Promise<{
     sessionComplete: boolean;
     taskResult: string;
     taskId: string;
+    validationScore: number | null;
 }> {
     const session = sessions.get(sessionId);
     if (!session) throw new Error('Session not found');
@@ -444,6 +498,16 @@ export async function rejectAndAdvance(sessionId: string): Promise<{
         currentAgent.agentAddress,
         currentAgent.senseiAddress
     );
+
+    // Update agent stats - increment tasksFailed
+    const agent = await prisma.agent.findFirst({ where: { address: currentAgent.agentAddress } });
+    if (agent) {
+        await prisma.agent.update({
+            where: { id: agent.id },
+            data: { tasksFailed: { increment: 1 } }
+        });
+        console.log(`[Rei] ❌ Agent ${agent.id} tasksFailed incremented`);
+    }
 
     session.completedOutputs.push({
         lane: currentAgent.lane,
@@ -464,7 +528,8 @@ export async function rejectAndAdvance(sessionId: string): Promise<{
         nextAgent,
         sessionComplete: session.status === 'COMPLETE',
         taskResult: task?.result || '',
-        taskId: currentAgent.taskId
+        taskId: currentAgent.taskId,
+        validationScore: task?.validationScore ?? null
     };
 }
 

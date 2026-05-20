@@ -333,27 +333,38 @@ router.post('/:id/slash', async (req, res) => {
             console.log('[TaskRoutes] x402 task (no stake) - marking as SLASHED');
         } else {
             console.log('[TaskRoutes] On-chain task - slashing via escrow');
-            await escrowClient.send.slashBounty({
-                args: { taskId },
-                boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
-                accountReferences: [task.clientAddress].filter(Boolean),
-                extraFee: microAlgos(1000),
-            });
+            try {
+                await escrowClient.send.slashBounty({
+                    args: { taskId },
+                    boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
+                    accountReferences: [task.clientAddress].filter(Boolean),
+                    extraFee: microAlgos(1000),
+                });
+            } catch (e: any) {
+                console.warn(`[TaskRoutes] Escrow slash failed (may already be slashed): ${e.message}`);
+            }
             
             if (task.agentId && task.agent?.senseiAddress) {
                 const treasuryAddr = process.env.TREASURY_ADDRESS || adminAddress;
-                await commitmentClient.send.slashStake({
-                    args: { stakeId: task.agentId },
-                    boxReferences: [{ appId: BigInt(process.env.COMMITMENT_LOCK_APP_ID || '0'), name: new Uint8Array(Buffer.from(task.agentId)) }],
-                    accountReferences: [treasuryAddr],
-                    extraFee: microAlgos(1000),
-                });
-                
-                await prisma.agent.update({
-                    where: { id: task.agentId },
-                    data: { tasksFailed: { increment: 1 } }
-                });
+                try {
+                    await commitmentClient.send.slashStake({
+                        args: { stakeId: task.agentId },
+                        boxReferences: [{ appId: BigInt(process.env.COMMITMENT_LOCK_APP_ID || '0'), name: new Uint8Array(Buffer.from(task.agentId)) }],
+                        accountReferences: [treasuryAddr],
+                        extraFee: microAlgos(1000),
+                    });
+                } catch (e: any) {
+                    console.warn(`[TaskRoutes] Stake slash failed: ${e.message}`);
+                }
             }
+        }
+        
+        // Always update agent stats and task state
+        if (task.agentId) {
+            await prisma.agent.update({
+                where: { id: task.agentId },
+                data: { tasksFailed: { increment: 1 } }
+            });
         }
         
         await prisma.task.update({

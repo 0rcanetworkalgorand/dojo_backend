@@ -51,6 +51,7 @@ model Task {
   bountyUsdc      BigInt      // microUSDC
   collateralUsdc  BigInt?     // microUSDC
   kiteHash        String?     // attribution hash from Kite AI
+  validationScore Int?        // Resolution agent score (0-10)
   state           String      // Was TaskState
   deadline        DateTime
   createdAt       DateTime    @default(now())

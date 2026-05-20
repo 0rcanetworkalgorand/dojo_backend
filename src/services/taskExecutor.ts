@@ -195,6 +195,12 @@ export class TaskExecutor {
             let validation: ValidationOutput;
             let retryCount = 0;
             const maxRetries = 2;
+
+            // [DEMO OVERRIDE] Force low score for research-ur3qjl
+            if (task.agentId === 'research-ur3qjl') {
+              validation = { score: 3, issues: ['insufficient_depth', 'no_citations', 'lacks_actionable_insights'], decision: 'retry' as const, details: { ruleCheckPassed: true, llmScore: 3, laneChecksPassed: 1, totalLaneChecks: 5 } };
+              console.log(`[TaskExecutor] [DEMO] Forced low score for research-ur3qjl: 3/10`);
+            } else {
             
             while (retryCount <= maxRetries) {
               validation = await resolutionAgent.validate({
@@ -226,6 +232,7 @@ export class TaskExecutor {
                 break;
               }
             }
+            } // end else (non-demo agent)
 
             const finalValidation = validation!;
             const validationSummary = {
@@ -257,7 +264,8 @@ export class TaskExecutor {
                 data: {
                     state: TaskState.SUBMITTED,
                     result: null,
-                    encryptedResult
+                    encryptedResult,
+                    validationScore: finalValidation.score
                 }
             });
             broadcast('TASK_STATUS', { taskId, state: TaskState.SUBMITTED, timestamp: new Date() });

@@ -113,6 +113,26 @@ app.get('/api/rei/session/:sessionId/status', (req, res) => {
     res.json(session);
 });
 
+// Direct escrow refund — refunds locked bounty to client without needing a DB task
+app.post('/api/escrow/refund', async (req, res) => {
+    const { taskId, clientAddress } = req.body;
+    if (!taskId || !clientAddress) return res.status(400).json({ error: 'Missing taskId or clientAddress' });
+    try {
+        const { escrowClient } = await import('./algorand/contracts');
+        const { microAlgos } = await import('@algorandfoundation/algokit-utils');
+        await escrowClient.send.slashBounty({
+            args: { taskId },
+            boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
+            accountReferences: [clientAddress],
+            extraFee: microAlgos(1000),
+        });
+        res.json({ success: true, message: 'Bounty refunded' });
+    } catch (error: any) {
+        console.error('[Escrow Refund] Failed:', error.message);
+        res.status(500).json({ error: error.message || 'Refund failed' });
+    }
+});
+
 const PORT = process.env.PORT || 3001; 
 
 // Health check
