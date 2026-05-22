@@ -1,4 +1,37 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -109,6 +142,27 @@ app.get('/api/rei/session/:sessionId/status', (req, res) => {
         return res.status(404).json({ error: 'Session not found.' });
     }
     res.json(session);
+});
+// Direct escrow refund — refunds locked bounty to client without needing a DB task
+app.post('/api/escrow/refund', async (req, res) => {
+    const { taskId, clientAddress } = req.body;
+    if (!taskId || !clientAddress)
+        return res.status(400).json({ error: 'Missing taskId or clientAddress' });
+    try {
+        const { escrowClient } = await Promise.resolve().then(() => __importStar(require('./algorand/contracts')));
+        const { microAlgos } = await Promise.resolve().then(() => __importStar(require('@algorandfoundation/algokit-utils')));
+        await escrowClient.send.slashBounty({
+            args: { taskId },
+            boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
+            accountReferences: [clientAddress],
+            extraFee: microAlgos(1000),
+        });
+        res.json({ success: true, message: 'Bounty refunded' });
+    }
+    catch (error) {
+        console.error('[Escrow Refund] Failed:', error.message);
+        res.status(500).json({ error: error.message || 'Refund failed' });
+    }
 });
 const PORT = process.env.PORT || 3001;
 // Health check

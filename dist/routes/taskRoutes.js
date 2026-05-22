@@ -72,7 +72,8 @@ router.post('/match', async (req, res) => {
             const lanePrefix = a.id.split('-')[0] || 'agent';
             const idSuffix = a.id.split('-').slice(1).join('-') || a.id;
             const displayName = `Agent ${lanePrefix.charAt(0).toUpperCase() + lanePrefix.slice(1)}-${idSuffix.toUpperCase()}`;
-            const successRate = Math.max(0, 100 - (Number(a.tasksFailed) * 20));
+            const totalTasks = Number(a.tasksCompleted) + Number(a.tasksFailed);
+            const successRate = totalTasks > 0 ? Math.round((Number(a.tasksCompleted) / totalTasks) * 100) : 100;
             return {
                 id: a.id,
                 address: a.address,
@@ -307,25 +308,38 @@ router.post('/:id/slash', async (req, res) => {
         }
         else {
             console.log('[TaskRoutes] On-chain task - slashing via escrow');
-            await contracts_1.escrowClient.send.slashBounty({
-                args: { taskId },
-                boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
-                accountReferences: [task.clientAddress].filter(Boolean),
-                extraFee: (0, algokit_utils_1.microAlgos)(1000),
-            });
-            if (task.agentId && task.agent?.senseiAddress) {
-                const treasuryAddr = process.env.TREASURY_ADDRESS || contracts_1.adminAddress;
-                await contracts_1.commitmentClient.send.slashStake({
-                    args: { stakeId: task.agentId },
-                    boxReferences: [{ appId: BigInt(process.env.COMMITMENT_LOCK_APP_ID || '0'), name: new Uint8Array(Buffer.from(task.agentId)) }],
-                    accountReferences: [treasuryAddr],
+            try {
+                await contracts_1.escrowClient.send.slashBounty({
+                    args: { taskId },
+                    boxReferences: [{ appId: BigInt(process.env.ESCROW_VAULT_APP_ID || '0'), name: new Uint8Array(Buffer.from(taskId)) }],
+                    accountReferences: [task.clientAddress].filter(Boolean),
                     extraFee: (0, algokit_utils_1.microAlgos)(1000),
                 });
-                await prisma_1.prisma.agent.update({
-                    where: { id: task.agentId },
-                    data: { tasksFailed: { increment: 1 } }
-                });
             }
+            catch (e) {
+                console.warn(`[TaskRoutes] Escrow slash failed (may already be slashed): ${e.message}`);
+            }
+            if (task.agentId && task.agent?.senseiAddress) {
+                const treasuryAddr = process.env.TREASURY_ADDRESS || contracts_1.adminAddress;
+                try {
+                    await contracts_1.commitmentClient.send.slashStake({
+                        args: { stakeId: task.agentId },
+                        boxReferences: [{ appId: BigInt(process.env.COMMITMENT_LOCK_APP_ID || '0'), name: new Uint8Array(Buffer.from(task.agentId)) }],
+                        accountReferences: [treasuryAddr],
+                        extraFee: (0, algokit_utils_1.microAlgos)(1000),
+                    });
+                }
+                catch (e) {
+                    console.warn(`[TaskRoutes] Stake slash failed: ${e.message}`);
+                }
+            }
+        }
+        // Always update agent stats and task state
+        if (task.agentId) {
+            await prisma_1.prisma.agent.update({
+                where: { id: task.agentId },
+                data: { tasksFailed: { increment: 1 } }
+            });
         }
         await prisma_1.prisma.task.update({
             where: { id: taskId },

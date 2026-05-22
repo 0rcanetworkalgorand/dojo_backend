@@ -26,8 +26,8 @@ router.get('/', async (req, res) => {
             where,
         });
         const mapped = agents.map(a => {
-            // Success rate starts at 100% and drops by 20% for each failed task
-            const successRate = Math.max(0, 100 - (Number(a.tasksFailed) * 20));
+            const totalTasks = Number(a.tasksCompleted) + Number(a.tasksFailed);
+            const successRate = totalTasks > 0 ? Math.round((Number(a.tasksCompleted) / totalTasks) * 100) : 100;
             const totalEarned = Number(a.totalEarnedUsdc);
             // Generate a clean display name from the agent ID (e.g. "data-y42bsr" → "Agent Data-Y42BSR")
             const lanePrefix = a.id.split('-')[0] || 'agent';
@@ -231,19 +231,14 @@ router.get('/stats/:address', async (req, res) => {
         let agents = await prisma_1.prisma.agent.findMany({
             where: { senseiAddress: address }
         });
-        const agentAddresses = agents.map(a => a.address);
-        const tasks = await prisma_1.prisma.task.findMany({
-            where: {
-                OR: [
-                    { clientAddress: address },
-                    { workerAddress: { in: agentAddresses } }
-                ]
-            }
-        });
+        const totalCompleted = agents.reduce((sum, a) => sum + Number(a.tasksCompleted), 0);
+        const totalFailed = agents.reduce((sum, a) => sum + Number(a.tasksFailed), 0);
+        const totalTasks = totalCompleted + totalFailed;
         const stats = {
             totalAgents: agents.length,
-            tasksToday: tasks.filter(t => t.createdAt > new Date(Date.now() - 86400000)).length,
-            usdcVolume: agents.reduce((sum, a) => sum + Number(a.totalEarnedUsdc), 0),
+            tasksToday: totalTasks,
+            successRate: totalTasks > 0 ? totalCompleted / totalTasks : 1,
+            totalVolume: agents.reduce((sum, a) => sum + Number(a.totalEarnedUsdc), 0),
         };
         console.log(`[Stats API] Returning stats for ${address}:`, stats);
         res.json(stats);

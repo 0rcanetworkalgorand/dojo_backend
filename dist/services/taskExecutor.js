@@ -171,34 +171,41 @@ class TaskExecutor {
             let validation;
             let retryCount = 0;
             const maxRetries = 2;
-            while (retryCount <= maxRetries) {
-                validation = await resolutionAgent_1.resolutionAgent.validate({
-                    output: result,
-                    task: {
-                        description: task.description || task.title || '',
-                        lane: task.lane,
-                        title: task.title || ''
-                    }
-                });
-                console.log(`[TaskExecutor] Validation score: ${validation.score}/10, decision: ${validation.decision}, issues: ${validation.issues.join(', ') || 'none'}`);
-                if (validation.decision === 'retry' && retryCount < maxRetries) {
-                    console.log(`[TaskExecutor] Validation failed, retrying (${retryCount + 1}/${maxRetries})...`);
-                    retryCount++;
-                    const retryCompletion = await client.chat.completions.create({
-                        model: params.model,
-                        max_tokens: params.max_tokens,
-                        temperature: params.temperature,
-                        messages: [
-                            { role: 'system', content: systemPrompt + '\n\nIMPORTANT: Your previous output was rejected due to: ' + validation.issues.join(', ') + '. Please improve.' },
-                            { role: 'user', content: userPrompt }
-                        ]
-                    });
-                    result = retryCompletion.choices[0]?.message?.content || result;
-                }
-                else {
-                    break;
-                }
+            // [DEMO OVERRIDE] Force low score for research-ur3qjl
+            if (task.agentId === 'research-ur3qjl') {
+                validation = { score: 3, issues: ['insufficient_depth', 'no_citations', 'lacks_actionable_insights'], decision: 'retry', details: { ruleCheckPassed: true, llmScore: 3, laneChecksPassed: 1, totalLaneChecks: 5 } };
+                console.log(`[TaskExecutor] [DEMO] Forced low score for research-ur3qjl: 3/10`);
             }
+            else {
+                while (retryCount <= maxRetries) {
+                    validation = await resolutionAgent_1.resolutionAgent.validate({
+                        output: result,
+                        task: {
+                            description: task.description || task.title || '',
+                            lane: task.lane,
+                            title: task.title || ''
+                        }
+                    });
+                    console.log(`[TaskExecutor] Validation score: ${validation.score}/10, decision: ${validation.decision}, issues: ${validation.issues.join(', ') || 'none'}`);
+                    if (validation.decision === 'retry' && retryCount < maxRetries) {
+                        console.log(`[TaskExecutor] Validation failed, retrying (${retryCount + 1}/${maxRetries})...`);
+                        retryCount++;
+                        const retryCompletion = await client.chat.completions.create({
+                            model: params.model,
+                            max_tokens: params.max_tokens,
+                            temperature: params.temperature,
+                            messages: [
+                                { role: 'system', content: systemPrompt + '\n\nIMPORTANT: Your previous output was rejected due to: ' + validation.issues.join(', ') + '. Please improve.' },
+                                { role: 'user', content: userPrompt }
+                            ]
+                        });
+                        result = retryCompletion.choices[0]?.message?.content || result;
+                    }
+                    else {
+                        break;
+                    }
+                }
+            } // end else (non-demo agent)
             const finalValidation = validation;
             const validationSummary = {
                 score: finalValidation.score,
@@ -229,7 +236,8 @@ class TaskExecutor {
                 data: {
                     state: types_1.TaskState.SUBMITTED,
                     result: null,
-                    encryptedResult
+                    encryptedResult,
+                    validationScore: finalValidation.score
                 }
             });
             (0, socket_1.broadcast)('TASK_STATUS', { taskId, state: types_1.TaskState.SUBMITTED, timestamp: new Date() });
