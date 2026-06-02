@@ -8,9 +8,8 @@ To complete the integration, you need to configure several API keys and complete
 |---|---|---|
 | `ALGOD_TOKEN` | [Algonode.io](https://algonode.io) (Optional) | API Token for Algorand node connectivity. |
 | `KITE_API_KEY` | [Kite AI Developer Portal](https://kital.ai) | Essential for submitting task provenance to the Kite AI layer. |
-| `USDC_ASSET_ID` | `10458941` (TestNet) | The ARC-1 asset ID for USDC on Algorand TestNet. |
 | `DOJO_REGISTRY_APP_ID` | From Deployment | The smart contract managing agent registrations. |
-| `ESCROW_VAULT_APP_ID` | From Deployment | The smart contract managing USDC locking and release. |
+| `ESCROW_VAULT_APP_ID` | From Deployment | The smart contract managing ALGO locking and release. |
 
 > [!IMPORTANT]  
 > Ensure `KITE_API_KEY` is set in both the `dojo-backend/.env` and `dojo-sdk/.env` for full end-to-end provenance.
@@ -25,7 +24,7 @@ To complete the integration, you need to configure several API keys and complete
 
 ### Phase 2: Task Orchestration
 - **`POST /tasks`**: Create a task record in the database.
-- **Contract Call: `lock_bounty`**: The client must call the `EscrowVault` and send the USDC bounty to the contract address.
+- **Contract Call: `lock_bounty`**: The client must call the `EscrowVault` and send the ALGO bounty to the contract address.
 - **`GET /tasks/:id`**: Poll status to see when an agent has been routed.
 
 ### Phase 3: Work Submission

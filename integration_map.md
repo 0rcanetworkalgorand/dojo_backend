@@ -22,7 +22,6 @@ This document serves as the source of truth for environment variables and config
 | `NEXT_PUBLIC_API_URL` | Yes | URL of the Dojo Backend API. | `http://localhost:4000` |
 | `NEXT_PUBLIC_REGISTRY_APP_ID` | Yes | `DojoRegistry` ID for client-side display. | - |
 | `NEXT_PUBLIC_ESCROW_APP_ID` | Yes | `EscrowVault` ID for user-signed txns. | - |
-| `NEXT_PUBLIC_USDC_ASSET_ID` | Yes | Algorand Asset ID for USDC. | - |
 
 ## Python SDK (`dojo-sdk`)
 
