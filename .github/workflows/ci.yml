@@ -20,15 +20,19 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Patch package.json to remove file dependency
+      - name: Remove file dependency for CI
         run: |
-          sed -i '/"@0rca\/dojo-contracts-artifacts"/d' package.json
+          node -e "
+          const pkg = require('./package.json');
+          delete pkg.dependencies['@0rca/dojo-contracts-artifacts'];
+          require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+          "
 
       - name: Install dependencies
         run: npm install --legacy-peer-deps
 
       - name: Generate Prisma client
-        run: npx prisma generate
+        run: node node_modules/prisma/build/index.js generate
 
       - name: Run unit tests
         run: npx vitest run
@@ -46,15 +50,19 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Patch package.json to remove file dependency
+      - name: Remove file dependency for CI
         run: |
-          sed -i '/"@0rca\/dojo-contracts-artifacts"/d' package.json
+          node -e "
+          const pkg = require('./package.json');
+          delete pkg.dependencies['@0rca/dojo-contracts-artifacts'];
+          require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+          "
 
       - name: Install dependencies
         run: npm install --legacy-peer-deps
 
       - name: Generate Prisma client
-        run: npx prisma generate
+        run: node node_modules/prisma/build/index.js generate
 
       - name: TypeScript type check
         run: npx tsc --noEmit
