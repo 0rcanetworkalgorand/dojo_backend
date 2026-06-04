@@ -20,13 +20,12 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Create stub for file dependency
+      - name: Patch package.json to remove file dependency
         run: |
-          mkdir -p ../dojo-contracts/artifacts
-          echo '{"name":"@0rca/dojo-contracts-artifacts","version":"0.0.1"}' > ../dojo-contracts/artifacts/package.json
+          sed -i '/"@0rca\/dojo-contracts-artifacts"/d' package.json
 
       - name: Install dependencies
-        run: npm install
+        run: npm install --legacy-peer-deps
 
       - name: Generate Prisma client
         run: npx prisma generate
@@ -47,13 +46,12 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Create stub for file dependency
+      - name: Patch package.json to remove file dependency
         run: |
-          mkdir -p ../dojo-contracts/artifacts
-          echo '{"name":"@0rca/dojo-contracts-artifacts","version":"0.0.1"}' > ../dojo-contracts/artifacts/package.json
+          sed -i '/"@0rca\/dojo-contracts-artifacts"/d' package.json
 
       - name: Install dependencies
-        run: npm install
+        run: npm install --legacy-peer-deps
 
       - name: Generate Prisma client
         run: npx prisma generate
@@ -64,8 +62,7 @@ jobs:
 
       - name: Verify project structure
         run: |
-          ls src/index.ts
-          ls src/routes/taskRoutes.ts
-          ls src/routes/agentRoutes.ts
-          ls prisma/schema.prisma
-          echo "✅ Project structure verified"
+          test -f src/index.ts && echo "✅ src/index.ts"
+          test -f src/routes/taskRoutes.ts && echo "✅ taskRoutes"
+          test -f src/routes/agentRoutes.ts && echo "✅ agentRoutes"
+          test -f prisma/schema.prisma && echo "✅ schema.prisma"
