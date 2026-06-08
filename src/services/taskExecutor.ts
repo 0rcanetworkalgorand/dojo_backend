@@ -3,7 +3,7 @@ import { prisma } from '../lib/prisma';
 import { TaskState } from '../lib/types';
 import { broadcast } from '../lib/socket';
 import { ConfigVault } from './configVault';
-import { escrowClient, commitmentClient, adminAddress, algorand } from '../algorand/contracts';
+import { escrowClient, commitmentClient, registryClient, adminAddress, algorand } from '../algorand/contracts';
 import { microAlgos } from '@algorandfoundation/algokit-utils';
 import { resolutionAgent, ValidationOutput } from './resolutionAgent';
 import fs from 'fs';
@@ -161,7 +161,8 @@ export class TaskExecutor {
                 data: { state: TaskState.LOCKED }
             });
             broadcast('TASK_STATUS', { taskId, state: TaskState.LOCKED, timestamp: new Date() });
-            console.log(`[TaskExecutor] Task ${taskId} state → LOCKED`);
+            const agentDisplayName = task.agent?.name || task.agentId;
+            console.log(`[TaskExecutor] Task ${taskId} state → LOCKED (Agent ${task.lane} "${agentDisplayName}")`);
 
             // 3. Get AI Client and parameters
             const { client, params } = await this.getClientForAgent(task.agentId);
@@ -274,7 +275,22 @@ export class TaskExecutor {
             // Payment will be released when user clicks "Satisfied" via /api/tasks/:id/release
             // Or slashed when user clicks "Not Satisfied" via /api/tasks/:id/slash
             console.log(`[TaskExecutor] ✅ Task ${taskId} output ready. Waiting for client approval...`);
-            console.log(`[TaskExecutor]    State: SUBMITTED. Payment will be released on approval.`);
+            console.log(`[TaskExecutor]    Agent ${task.lane} "${task.agent?.name || task.agentId}" | State: SUBMITTED`);
+
+            // 6b. INCREMENT ON-CHAIN TASK COUNT (immutable reputation)
+            if (task.agentId) {
+                try {
+                    await registryClient.send.incrementTasks({
+                        args: { agentId: task.agentId },
+                        boxReferences: [
+                            { appId: BigInt(process.env.DOJO_REGISTRY_APP_ID || '0'), name: new Uint8Array(Buffer.from(task.agentId)) }
+                        ],
+                    });
+                    console.log(`[TaskExecutor] ✅ On-chain tasksCompleted incremented for ${task.agentId}`);
+                } catch (chainErr: any) {
+                    console.warn(`[TaskExecutor] WARNING: Failed to increment on-chain task count for ${task.agentId}:`, chainErr.message);
+                }
+            }
 
             // 7. Broadcast the result - client must approve to release payment
             broadcast('TASK_RESULT', {
@@ -358,7 +374,21 @@ export class TaskExecutor {
 
             // [GLOBAL FAILURE TRACKING] Increment failed tasks for the agent
             if (task && task.agentId) {
-                console.log(`[TaskExecutor] Logging failure for Agent: ${task.agentId}`);
+                console.log(`[TaskExecutor] Logging failure for Agent ${task.lane} "${task.agent?.name || task.agentId}"`);
+                
+                // INCREMENT ON-CHAIN FAILED TASK COUNT (immutable reputation)
+                try {
+                    await registryClient.send.incrementTasksFailed({
+                        args: { agentId: task.agentId },
+                        boxReferences: [
+                            { appId: BigInt(process.env.DOJO_REGISTRY_APP_ID || '0'), name: new Uint8Array(Buffer.from(task.agentId)) }
+                        ],
+                    });
+                    console.log(`[TaskExecutor] ✅ On-chain tasksFailed incremented for ${task.agentId}`);
+                } catch (chainErr: any) {
+                    console.warn(`[TaskExecutor] WARNING: Failed to increment on-chain failed count for ${task.agentId}:`, chainErr.message);
+                }
+
                 try {
                     // [DEMO OVERRIDE] for agent data-9: increment both to match user's demo logic
                     if (task.agentId === 'agent data-9') {

@@ -19,6 +19,7 @@ model Agent {
   id              String   @id @default(uuid())
   address         String   @unique
   senseiAddress   String
+  name            String?  @unique
   lane            String   // Was LaneType
   status          String   // Was AgentStatus
   configHash      String

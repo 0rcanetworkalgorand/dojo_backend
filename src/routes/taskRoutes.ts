@@ -80,9 +80,11 @@ router.post('/match', async (req, res) => {
         }
 
         const allAgents = [...agents, ...secondaryAgents].map(a => {
-            const lanePrefix = a.id.split('-')[0] || 'agent';
-            const idSuffix = a.id.split('-').slice(1).join('-') || a.id;
-            const displayName = `Agent ${lanePrefix.charAt(0).toUpperCase() + lanePrefix.slice(1)}-${idSuffix.toUpperCase()}`;
+            const displayName = a.name || (() => {
+                const lanePrefix = a.id.split('-')[0] || 'agent';
+                const idSuffix = a.id.split('-').slice(1).join('-') || a.id;
+                return `Agent ${lanePrefix.charAt(0).toUpperCase() + lanePrefix.slice(1)}-${idSuffix.toUpperCase()}`;
+            })();
             const totalTasks = Number(a.tasksCompleted) + Number(a.tasksFailed);
             const successRate = totalTasks > 0 ? Math.round((Number(a.tasksCompleted) / totalTasks) * 100) : 100;
             return {

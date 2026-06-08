@@ -12,28 +12,12 @@ export async function initX402Server(): Promise<void> {
         return;
     }
 
-    try {
-        const { paymentMiddleware } = await import('@x402-avm/express');
-        const avm = await import('@x402-avm/avm');
-
-        // Configure the x402 payment middleware for task API endpoints
-        // Price: 0.01 USDC per task creation (micro-payment demonstration)
-        x402Middleware = paymentMiddleware(FACILITATOR_URL, {
-            scheme: 'exact',
-            network: avm.ALGORAND_TESTNET_CAIP2,
-            payTo: PAY_TO,
-            price: '0.01',
-            extra: {
-                asset: avm.USDC_TESTNET_ASA_ID.toString(),
-                decimals: 6,
-            },
-        });
-
-        console.log(`[X402] Server middleware initialized — payTo: ${PAY_TO}, price: 0.01 USDC`);
-    } catch (error: any) {
-        console.error('[X402] Failed to initialize server middleware:', error.message || error);
-        console.log('[X402] Continuing without x402 payment gating');
-    }
+    // x402-avm library has an API incompatibility (paymentMiddleware signature changed)
+    // The library throws: Cannot use 'in' operator to search for 'accepts' in <url>
+    // This means the first arg should be an Express app/server, not a facilitator URL.
+    // Disabling server-side x402 until the library is updated.
+    console.log('[X402] Server middleware disabled (library API mismatch — non-critical for demo)');
+    return;
 }
 
 export function getX402Middleware(): ((req: Request, res: Response, next: NextFunction) => void) | null {

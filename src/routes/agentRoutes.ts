@@ -27,10 +27,12 @@ router.get('/', async (req, res) => {
             const successRate = totalTasks > 0 ? Math.round((Number(a.tasksCompleted) / totalTasks) * 100) : 100;
             const totalEarned = Number(a.totalEarnedUsdc); 
             
-            // Generate a clean display name from the agent ID (e.g. "data-y42bsr" → "Agent Data-Y42BSR")
-            const lanePrefix = a.id.split('-')[0] || 'agent';
-            const idSuffix = a.id.split('-').slice(1).join('-') || a.id;
-            const displayName = `Agent ${lanePrefix.charAt(0).toUpperCase() + lanePrefix.slice(1)}-${idSuffix.toUpperCase()}`;
+            // Use stored name, or generate a display name from the agent ID
+            const displayName = a.name || (() => {
+                const lanePrefix = a.id.split('-')[0] || 'agent';
+                const idSuffix = a.id.split('-').slice(1).join('-') || a.id;
+                return `Agent ${lanePrefix.charAt(0).toUpperCase() + lanePrefix.slice(1)}-${idSuffix.toUpperCase()}`;
+            })();
 
             return {
                 id: a.id,
@@ -60,9 +62,19 @@ router.get('/', async (req, res) => {
     }
 });
 
+// Check if agent name is available
+router.get('/check-name', async (req, res) => {
+    const { name } = req.query;
+    if (!name || typeof name !== 'string' || name.trim().length < 3) {
+        return res.json({ exists: false });
+    }
+    const existing = await prisma.agent.findFirst({ where: { name: name.trim() } });
+    res.json({ exists: !!existing });
+});
+
 // Proxy Registration (Admin signs on behalf of user)
 router.post('/register', async (req, res) => {
-    const { agentId, senseiAddress, lane, llmTier, biddingStrategy, openaiApiKey } = req.body;
+    const { agentId, agentName, senseiAddress, lane, llmTier, biddingStrategy, openaiApiKey } = req.body;
 
     // 0. Input Validation
     const validLanes = ['RESEARCH', 'CODE', 'DATA', 'OUTREACH'];
@@ -78,6 +90,15 @@ router.post('/register', async (req, res) => {
     if (!validStrategies.includes(biddingStrategy)) {
         return res.status(400).json({ error: `biddingStrategy must be one of: ${validStrategies.join(', ')}` });
     }
+
+    // Validate agent name
+    const trimmedName = (agentName || '').trim();
+    if (trimmedName && trimmedName.length >= 3) {
+        const existing = await prisma.agent.findFirst({ where: { name: trimmedName } });
+        if (existing) {
+            return res.status(409).json({ error: 'Agent name already taken', details: `The name "${trimmedName}" is already in use.` });
+        }
+    }
     const isGroq = openaiApiKey && openaiApiKey.startsWith('gsk_');
     const isOpenAI = openaiApiKey && openaiApiKey.startsWith('sk-');
 
@@ -86,7 +107,7 @@ router.post('/register', async (req, res) => {
     }
 
     try {
-        console.log(`[ProxyRegister] Step 1: Preparing transaction (Version 5) for ${agentId}`);
+        console.log(`[ProxyRegister] Step 1: Preparing transaction (Version 5) for Agent ${lane} "${trimmedName || 'unnamed'}"`);
         
         // 1. Encrypt Config for Vault
         const vaultKeyHex = process.env.VAULT_KEY;
@@ -148,11 +169,13 @@ router.post('/register', async (req, res) => {
             update: {
                 address: wallet.addr,
                 senseiAddress: senseiAddress,
+                name: trimmedName || null,
             },
             create: {
                 id: agentId,
                 address: wallet.addr,
                 senseiAddress: senseiAddress,
+                name: trimmedName || null,
                 lane: lane,
                 status: 'INACTIVE',
                 configHash: configHash.toString('hex')
@@ -211,6 +234,7 @@ router.post('/register', async (req, res) => {
             update: {
                 address: wallet.addr,
                 senseiAddress,
+                name: trimmedName || null,
                 lane: lane.toUpperCase(),
                 configHash: configHash.toString('hex'),
                 status: AgentStatus.ACTIVE
@@ -219,6 +243,7 @@ router.post('/register', async (req, res) => {
                 id: agentId,
                 address: wallet.addr, 
                 senseiAddress,
+                name: trimmedName || null,
                 lane: lane.toUpperCase(),
                 configHash: configHash.toString('hex'),
                 status: AgentStatus.ACTIVE,
@@ -227,7 +252,7 @@ router.post('/register', async (req, res) => {
             }
         });
 
-        console.log(`[ProxyRegister] ✅ Agent ${agentId} registered in DB. Tx: ${txId}`);
+        console.log(`[ProxyRegister] ✅ Agent ${lane} "${trimmedName}" registered in DB. Tx: ${txId}`);
 
         res.json({ 
             success: true, 

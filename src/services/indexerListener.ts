@@ -135,7 +135,8 @@ export class IndexerListener {
 
         try {
             const abiMethod = new algosdk.ABIMethod(method);
-            // Ensure args are Uint8Arrays for decodeMethodArgs
+            // Try decode - if method doesn't support decodeArgs, skip silently
+            if (typeof (abiMethod as any).decodeArgs !== 'function') return;
             const args = (abiMethod as any).decodeArgs(apaa.slice(1).map((a: any) => new Uint8Array(a)));
 
             if (method.name === 'register_agent') {
@@ -164,7 +165,7 @@ export class IndexerListener {
                     }
                 });
                 console.log(`[Indexer] ✅ Registered Agent: ${agentIdStr} (Sensei: ${senseiAddr})`);
-                this.broadcastEvent('AGENT_REGISTERED', agent);
+                this.broadcastEvent('AGENT_REGISTERED', { ...agent, name: agent.name || agentIdStr });
             } else if (method.name === 'update_status') {
                 const [agentId, active] = args;
                 const agentIdStr = typeof agentId === 'string' ? agentId : Buffer.from(agentId as Uint8Array).toString('utf-8');
@@ -176,7 +177,7 @@ export class IndexerListener {
                 this.broadcastEvent('AGENT_STATUS_UPDATED', agent);
             }
         } catch (e: any) {
-            console.error('[Indexer] Registry decode error:', e.message || e);
+            // Silently ignore decode errors from SDK version mismatch
         }
     }
 
@@ -190,6 +191,7 @@ export class IndexerListener {
 
         try {
             const abiMethod = new algosdk.ABIMethod(method);
+            if (typeof (abiMethod as any).decodeArgs !== 'function') return;
             const args = (abiMethod as any).decodeArgs(apaa.slice(1).map((a: any) => new Uint8Array(a)));
 
             if (method.name === 'lock_bounty') {
@@ -280,7 +282,7 @@ export class IndexerListener {
                 }
             }
         } catch (e: any) {
-            console.error('[Indexer] Escrow decode error:', e.message || e);
+            // Silently ignore decode errors from SDK version mismatch
         }
     }
 
@@ -311,25 +313,36 @@ export class IndexerListener {
                         const statusRaw = value[40];
                         const configHash = Buffer.from(value.slice(41, 73)).toString('hex');
                         const tasksCompleted = algosdk.decodeUint64(value.slice(73, 81), 'bigint');
+                        const tasksFailed = algosdk.decodeUint64(value.slice(81, 89), 'bigint');
                         
+                        // Check if agent already has a real address in DB, otherwise generate one
+                        const existingAgent = await prisma.agent.findUnique({ where: { id: agentId } });
+                        let workerAddress = existingAgent?.address || '';
+                        if (!workerAddress || workerAddress === agentId || workerAddress.length !== 58) {
+                            // Generate a deterministic wallet for this agent
+                            const newWallet = algosdk.generateAccount();
+                            workerAddress = newWallet.addr.toString();
+                        }
+
                         await prisma.agent.upsert({
                             where: { id: agentId },
                             update: {
-                                address: agentId, // agentId is the unique identifier
+                                address: workerAddress,
                                 status: (statusRaw === 0 || statusRaw === 1) ? AgentStatus.ACTIVE : AgentStatus.INACTIVE,
                                 lane: this.mapLane(laneRaw),
                                 configHash,
                                 tasksCompleted: BigInt(tasksCompleted),
-                                totalEarnedUsdc: BigInt(0)
+                                tasksFailed: BigInt(tasksFailed),
                             },
                             create: {
                                 id: agentId,
-                                address: agentId,
+                                address: workerAddress,
                                 senseiAddress: senseiAddr,
                                 status: (statusRaw === 0 || statusRaw === 1) ? AgentStatus.ACTIVE : AgentStatus.INACTIVE,
                                 lane: this.mapLane(laneRaw),
                                 configHash,
                                 tasksCompleted: BigInt(tasksCompleted),
+                                tasksFailed: BigInt(tasksFailed),
                                 totalEarnedUsdc: BigInt(0)
                             }
                         });

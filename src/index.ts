@@ -8,6 +8,15 @@ import { LaneType, AgentStatus, TaskState } from './lib/types';
 import { prisma } from './lib/prisma';
 import { TaskRouter } from './services/taskRouter';
 import { IndexerListener } from './services/indexerListener';
+
+// Prevent unhandled promise rejections from crashing the process (x402 lib issue)
+process.on('unhandledRejection', (reason: any) => {
+    if (reason?.message?.includes('initialize') || reason?.message?.includes('x402') || reason?.message?.includes('ResourceServer')) {
+        console.warn('[X402] Suppressed unhandled rejection from x402 library:', reason.message);
+    } else {
+        console.error('[FATAL] Unhandled rejection:', reason);
+    }
+});
 import { startCommitmentWatcher } from './services/commitmentWatcher';
 import agentRoutes from './routes/agentRoutes';
 import taskRoutes from './routes/taskRoutes';
@@ -33,7 +42,9 @@ app.use(express.json());
 
 // Initialize x402 (payment protocol)
 console.log('[Init] Setting up x402...');
-initX402Client().then(() => console.log('[Init] X402 client ready'));
+initX402Client().then(() => console.log('[Init] X402 client ready')).catch((err) => {
+    console.warn('[Init] X402 client init failed (non-fatal):', err.message);
+});
 initX402Server().then(() => {
     console.log('[Init] X402 server ready');
     const middleware = getX402Middleware();
@@ -43,6 +54,9 @@ initX402Server().then(() => {
     } else {
         app.use('/api/tasks', taskRoutes);
     }
+}).catch((err) => {
+    console.warn('[Init] X402 server init failed (non-fatal):', err.message);
+    app.use('/api/tasks', taskRoutes);
 });
 
 app.use('/api/agents', agentRoutes);
