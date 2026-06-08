@@ -324,6 +324,14 @@ export class IndexerListener {
                             workerAddress = newWallet.addr.toString();
                         }
 
+                        // Only update task counters if on-chain values are HIGHER than DB
+                        // (prevents overwriting DB values when on-chain increments fail)
+                        const existingAgent = await prisma.agent.findUnique({ where: { id: agentId } });
+                        const dbCompleted = existingAgent?.tasksCompleted ?? BigInt(0);
+                        const dbFailed = existingAgent?.tasksFailed ?? BigInt(0);
+                        const finalCompleted = BigInt(tasksCompleted) > dbCompleted ? BigInt(tasksCompleted) : dbCompleted;
+                        const finalFailed = BigInt(tasksFailed) > dbFailed ? BigInt(tasksFailed) : dbFailed;
+
                         await prisma.agent.upsert({
                             where: { id: agentId },
                             update: {
@@ -331,8 +339,8 @@ export class IndexerListener {
                                 status: (statusRaw === 0 || statusRaw === 1) ? AgentStatus.ACTIVE : AgentStatus.INACTIVE,
                                 lane: this.mapLane(laneRaw),
                                 configHash,
-                                tasksCompleted: BigInt(tasksCompleted),
-                                tasksFailed: BigInt(tasksFailed),
+                                tasksCompleted: finalCompleted,
+                                tasksFailed: finalFailed,
                             },
                             create: {
                                 id: agentId,
