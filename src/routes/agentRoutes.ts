@@ -192,7 +192,7 @@ router.post('/register', async (req, res) => {
             
             // Mitigate algokit-utils bug expecting `transaction.from.publicKey` on v2 Transaction objects
             // by explicitly passing the signer into a 0-ALGO dummy transaction in the group.
-            const dummyTxn = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
+            const dummyTxn = (algosdk as any).makePaymentTxnWithSuggestedParamsFromObject({
                 from: adminAddress,
                 to: adminAddress,
                 amount: 0,
