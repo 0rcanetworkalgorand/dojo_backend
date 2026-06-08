@@ -3,10 +3,13 @@
   "version": "0.1.0",
   "description": "Coordination layer for 0rca Swarm Dojo",
   "main": "dist/index.js",
+  "engines": {
+    "node": "20.x"
+  },
   "scripts": {
     "dev": "nodemon --exec npx ts-node --transpile-only src/index.ts",
     "sync": "ts-node src/scripts/sync.ts",
-    "build": "tsc",
+    "build": "npx prisma generate && tsc",
     "start": "node dist/index.js",
     "lint": "eslint . --ext .ts",
     "test": "vitest run",
@@ -16,7 +19,6 @@
     "prisma:migrate": "prisma migrate dev"
   },
   "dependencies": {
-    "@0rca/dojo-contracts-artifacts": "file:../dojo-contracts/artifacts",
     "@algorandfoundation/algokit-utils": "^7.1.0",
     "@prisma/client": "^5.10.2",
     "@x402-avm/avm": "^2.6.1",
@@ -46,7 +48,7 @@
     "prisma": "^5.10.2",
     "supertest": "^7.2.2",
     "ts-node": "^10.9.2",
-    "typescript": "^5.3.3",
+    "typescript": "~5.7.0",
     "vitest": "^4.1.8"
   }
 }

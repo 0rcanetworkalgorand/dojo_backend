@@ -10,12 +10,13 @@
     "skipLibCheck": true,
     "noImplicitAny": false,
     "forceConsistentCasingInFileNames": true,
-    "moduleResolution": "node",
+    "moduleResolution": "node10",
     "resolveJsonModule": true,
     "baseUrl": ".",
     "paths": {
       "@/*": ["src/*"]
-    }
+    },
+    "ignoreDeprecations": "5.0"
   },
   "ts-node": {
     "transpileOnly": true
