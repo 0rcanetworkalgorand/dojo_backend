@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "nodemon --exec npx ts-node --transpile-only src/index.ts",
     "sync": "ts-node src/scripts/sync.ts",
-    "build": "npx prisma generate && tsc",
+    "build": "npx prisma generate && npx tsc",
     "start": "node dist/index.js",
     "lint": "eslint . --ext .ts",
     "test": "vitest run",
